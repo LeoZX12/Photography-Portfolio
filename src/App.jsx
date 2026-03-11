@@ -1,11 +1,11 @@
-import PhotographyPortfolio from "./photography-portfolio";
+import PhotographyPortfolio from "./photography-portfolio"
 
 function App() {
   return (
     <div>
-      <PhotographyPortfolio />
+      <photography-portfolio />
     </div>
-  );
+  )
 }
 
-export default App;
+export default App
