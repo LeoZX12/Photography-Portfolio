@@ -169,6 +169,7 @@ export default function LeosPOV() {
   const [settings, setSettings]   = useState(false);
   const [resetDone, setResetDone] = useState(false);
   const [toast, setToast]         = useState("");
+  const [newPrompt, setNewPrompt]   = useState(null); // { count, scrollTo }
   const keyBuffer   = useRef("");
   const keyTimer    = useRef(null);
   const pollTimer   = useRef(null);
@@ -251,7 +252,8 @@ export default function LeosPOV() {
 
       saveCached(merged);
       setPhotos(merged);
-      showToast(`${newPhotos.length} new photo${newPhotos.length > 1 ? "s" : ""} added`);
+      // Show sticky new-photo prompt (auto-dismiss after 8s)
+      setNewPrompt({ count: newPhotos.length });
 
       // Resolve new photos immediately
       await Promise.all(newPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
@@ -264,6 +266,13 @@ export default function LeosPOV() {
     pollTimer.current = setInterval(silentPoll, POLL_MS);
     return () => clearInterval(pollTimer.current);
   }, [silentPoll]);
+
+  // Auto-dismiss new-photo prompt after 8s
+  useEffect(() => {
+    if (!newPrompt) return;
+    const t = setTimeout(() => setNewPrompt(null), 8000);
+    return () => clearTimeout(t);
+  }, [newPrompt]);
 
   // ── Secret code ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -452,6 +461,62 @@ export default function LeosPOV() {
         .pf-sett-div  { height: 1px; background: var(--border); }
         .pf-sett-hint { font-size: .64rem; font-weight: 300; color: var(--dim); text-align: center; letter-spacing: .06em; line-height: 1.7; opacity: .6; }
 
+        /* NEW PHOTO PROMPT */
+        .pf-new-prompt {
+          position: fixed;
+          top: 72px;
+          left: 50%;
+          transform: translateX(-50%) translateY(-4px);
+          z-index: 500;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          background: var(--white);
+          color: #090d14;
+          padding: 10px 18px 10px 14px;
+          border-radius: 999px;
+          font-family: var(--sans);
+          font-size: .78rem;
+          font-weight: 500;
+          letter-spacing: .02em;
+          box-shadow: 0 4px 24px rgba(0,0,0,.45), 0 1px 4px rgba(0,0,0,.3);
+          cursor: pointer;
+          white-space: nowrap;
+          animation: prompt-in .35s cubic-bezier(.16,1,.3,1);
+          transition: transform .18s, box-shadow .18s;
+          -webkit-tap-highlight-color: transparent;
+          user-select: none;
+        }
+        .pf-new-prompt:hover {
+          transform: translateX(-50%) translateY(-6px);
+          box-shadow: 0 8px 32px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.3);
+        }
+        .pf-new-prompt:active {
+          transform: translateX(-50%) translateY(-2px);
+        }
+        @keyframes prompt-in {
+          from { opacity: 0; transform: translateX(-50%) translateY(-16px); }
+          to   { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+        }
+        .pf-prompt-dot {
+          width: 8px; height: 8px;
+          border-radius: 50%;
+          background: #3a7d44;
+          flex-shrink: 0;
+          animation: live 2.5s ease-in-out infinite;
+        }
+        .pf-prompt-dismiss {
+          margin-left: 4px;
+          width: 18px; height: 18px;
+          border-radius: 50%;
+          background: rgba(9,13,20,.12);
+          display: flex; align-items: center; justify-content: center;
+          font-size: .65rem;
+          flex-shrink: 0;
+          transition: background .15s;
+        }
+        .pf-new-prompt:hover .pf-prompt-dismiss { background: rgba(9,13,20,.2); }
+
         /* TOAST */
         .pf-toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%); z-index: 1000; background: var(--surf2); border: 1px solid var(--bord2); color: var(--white); font-size: .76rem; padding: 10px 22px; white-space: nowrap; pointer-events: none; animation: toast-in .22s cubic-bezier(.16,1,.3,1); }
         @keyframes toast-in { from { opacity:0; transform:translateX(-50%) translateY(8px); } }
@@ -584,6 +649,26 @@ export default function LeosPOV() {
                 <p className="pf-sett-hint">Press <strong style={{color:"var(--grey)"}}>LJCBSET</strong> to toggle this panel</p>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* New photo prompt */}
+        {newPrompt && (
+          <div
+            className="pf-new-prompt"
+            onClick={() => {
+              window.scrollTo({ top: 0, behavior: "smooth" });
+              setNewPrompt(null);
+            }}
+          >
+            <span className="pf-prompt-dot" />
+            <span>
+              {newPrompt.count} new photo{newPrompt.count > 1 ? "s" : ""} — tap to view
+            </span>
+            <span
+              className="pf-prompt-dismiss"
+              onClick={e => { e.stopPropagation(); setNewPrompt(null); }}
+            >✕</span>
           </div>
         )}
 
