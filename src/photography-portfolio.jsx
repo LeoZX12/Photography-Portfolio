@@ -1,81 +1,165 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const BOT_TOKEN = "8662339296:AAEMzUBkgN9nuDLmDgxE93l5IarlGiB0Ikc";
+const BOT_TOKEN  = "8662339296:AAEMzUBkgN9nuDLmDgxE93l5IarlGiB0Ikc";
 const CHANNEL_ID = "-1003831838516";
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const CACHE_KEY = "tg_leos_pov_v1";
-const OFFSET_KEY = "tg_leos_pov_offset_v1";
-const SECRET_CODE = "LJCBSET";
+const API        = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const CACHE_KEY  = "tg_leos_pov_v3";  // bumped so stale offset caches are ignored
+const SECRET     = "LJCBSET";
+const POLL_MS    = 20000;
 
-function getCached() {
-  try { return JSON.parse(localStorage.getItem(CACHE_KEY) || "[]"); } catch { return []; }
-}
-function saveCached(photos) {
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify(photos.map(({ id, file_id, caption, date }) => ({ id, file_id, caption, date })))); } catch {}
-}
-function getStoredOffset() {
-  try { return parseInt(localStorage.getItem(OFFSET_KEY) || "0", 10) || 0; } catch { return 0; }
-}
-function saveOffset(n) { try { localStorage.setItem(OFFSET_KEY, String(n)); } catch {} }
-
-async function fetchUpdates(offset) {
-  const params = `limit=100&allowed_updates=${encodeURIComponent('["channel_post"]')}${offset ? `&offset=${offset}` : ""}`;
-  const res = await fetch(`${API}/getUpdates?${params}`);
-  if (!res.ok) throw new Error(`Network error ${res.status}`);
-  const data = await res.json();
-  if (!data.ok) throw new Error(data.description || "Telegram API error");
-  return data.result;
-}
-
+// ─── In-memory URL cache (survives re-renders, not page reload – Telegram URLs expire) ───
+const urlCache = new Map();
 async function resolveUrl(file_id) {
+  if (urlCache.has(file_id)) return urlCache.get(file_id);
   try {
-    const res = await fetch(`${API}/getFile?file_id=${encodeURIComponent(file_id)}`);
-    const data = await res.json();
-    if (data.ok) return `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
+    const r = await fetch(`${API}/getFile?file_id=${encodeURIComponent(file_id)}`);
+    const d = await r.json();
+    if (d.ok) {
+      const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${d.result.file_path}`;
+      urlCache.set(file_id, url);
+      return url;
+    }
   } catch {}
   return null;
 }
 
-async function resolveBatch(photos, onProgress) {
-  const SIZE = 6;
-  const results = photos.map((p) => ({ ...p }));
-  for (let i = 0; i < photos.length; i += SIZE) {
-    const batch = photos.slice(i, i + SIZE);
-    const urls = await Promise.all(batch.map((p) => resolveUrl(p.file_id)));
-    batch.forEach((photo, j) => {
-      const idx = results.findIndex((p) => p.id === photo.id);
-      if (idx !== -1) results[idx].url = urls[j] || "error";
-    });
-    onProgress([...results]);
-    if (i + SIZE < photos.length) await new Promise((r) => setTimeout(r, 120));
-  }
-  return results;
+// ─── Resolve thumb + full in parallel, update photo entry live ───
+async function resolvePhoto(photo, onUpdate) {
+  const [thumbUrl, fullUrl] = await Promise.all([
+    resolveUrl(photo.thumb_file_id),
+    resolveUrl(photo.file_id),
+  ]);
+  const updated = { ...photo, thumbUrl: thumbUrl || null, url: fullUrl || "error" };
+  onUpdate(updated);
+  return updated;
 }
 
-const FacebookIcon = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/>
-  </svg>
-);
-const TikTokIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34l-.02-8.38a8.17 8.17 0 0 0 4.79 1.52V5.01a4.85 4.85 0 0 1-1-.32z"/>
-  </svg>
-);
-const InstagramIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
-    <circle cx="12" cy="12" r="5"/>
-    <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
-  </svg>
-);
-const GearIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <circle cx="12" cy="12" r="3"/>
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-  </svg>
-);
+// ─── localStorage ───
+function getCached() {
+  try { return JSON.parse(localStorage.getItem(CACHE_KEY) || "[]"); } catch { return []; }
+}
+function saveCached(photos) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(
+      photos.map(({ id, file_id, thumb_file_id, caption, date, w, h }) =>
+        ({ id, file_id, thumb_file_id, caption, date, w, h }))
+    ));
+  } catch {}
+}
 
+
+// ─── Fetch Telegram updates ─────────────────────────────────────────────────
+// We intentionally NEVER pass an offset so Telegram never deletes pending
+// updates. The localStorage cache is the permanent source of truth; getUpdates
+// is only used to discover photos not yet in the cache.
+async function fetchUpdates() {
+  const p = `limit=100&allowed_updates=${encodeURIComponent('["channel_post"]')}`;
+  const r = await fetch(`${API}/getUpdates?${p}`);
+  if (!r.ok) throw new Error(`Network error ${r.status}`);
+  const d = await r.json();
+  if (!d.ok) throw new Error(d.description || "Telegram API error");
+  return d.result;
+}
+
+function parsePhotosFromUpdates(updates, skipIds = new Set()) {
+  const photos = [];
+  for (const u of updates) {
+    const post = u.channel_post;
+    if (!post?.photo) continue;
+    if (CHANNEL_ID && String(post.chat.id) !== String(CHANNEL_ID)) continue;
+    if (skipIds.has(post.message_id)) continue;
+    const sizes   = post.photo;
+    const largest = sizes[sizes.length - 1];
+    const thumb   = sizes.find(s => s.width >= 80) || sizes[0];
+    photos.push({
+      id:            post.message_id,
+      file_id:       largest.file_id,
+      thumb_file_id: thumb.file_id,
+      caption:       post.caption || "",
+      date:          new Date(post.date * 1000),
+      w:             largest.width,
+      h:             largest.height,
+      thumbUrl:      null,
+      url:           null,
+    });
+  }
+  return photos;
+}
+
+// ─── Icons ───
+const FacebookIcon  = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/></svg>;
+const TikTokIcon    = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34l-.02-8.38a8.17 8.17 0 0 0 4.79 1.52V5.01a4.85 4.85 0 0 1-1-.32z"/></svg>;
+const InstagramIcon = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"/><circle cx="12" cy="12" r="5"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>;
+const GearIcon      = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
+
+// ─── PhotoCell: viewport-aware, thumb→full two-phase loader ───
+function PhotoCell({ photo, index, onClick }) {
+  const wrapRef      = useRef(null);
+  const [visible, setVisible]     = useState(index < 6); // first 6 eager
+  const [thumbLoaded, setThumbLoaded] = useState(false);
+  const [fullLoaded, setFullLoaded]   = useState(false);
+  const aspectRatio  = photo.w && photo.h ? photo.w / photo.h : 1;
+
+  // IntersectionObserver – start loading when 200px away from viewport
+  useEffect(() => {
+    if (visible) return;
+    const el = wrapRef.current;
+    if (!el || !window.IntersectionObserver) { setVisible(true); return; }
+    const io = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) { setVisible(true); io.disconnect(); } },
+      { rootMargin: "200px" }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [visible]);
+
+  const hasThumb = photo.thumbUrl && photo.thumbUrl !== "error";
+  const hasFull  = photo.url     && photo.url     !== "error";
+
+  return (
+    <div
+      ref={wrapRef}
+      className="pf-cell"
+      onClick={() => hasFull && onClick()}
+      style={{ cursor: hasFull ? "pointer" : "default", aspectRatio }}
+    >
+      {/* Shimmer — shown until thumb appears */}
+      {!thumbLoaded && !fullLoaded && <div className="pf-skel" />}
+
+      {/* Thumbnail layer — blurred placeholder, loads first */}
+      {visible && hasThumb && (
+        <img
+          className={`pf-img pf-thumb${thumbLoaded ? " loaded" : ""}`}
+          src={photo.thumbUrl}
+          alt=""
+          aria-hidden="true"
+          decoding="async"
+          onLoad={() => setThumbLoaded(true)}
+        />
+      )}
+
+      {/* Full-res layer — fades in sharp over the thumb */}
+      {visible && hasFull && (
+        <img
+          className={`pf-img pf-full${fullLoaded ? " loaded" : ""}`}
+          src={photo.url}
+          alt={photo.caption || `Photo ${index + 1}`}
+          decoding="async"
+          onLoad={() => setFullLoaded(true)}
+        />
+      )}
+
+      {/* Caption overlay */}
+      {hasFull && photo.caption && (
+        <div className="pf-overlay">
+          <p className="pf-cap">{photo.caption}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Main Component ───
 export default function LeosPOV() {
   const [photos, setPhotos]       = useState([]);
   const [status, setStatus]       = useState("idle");
@@ -85,103 +169,138 @@ export default function LeosPOV() {
   const [settings, setSettings]   = useState(false);
   const [resetDone, setResetDone] = useState(false);
   const [toast, setToast]         = useState("");
-  const keyBuffer                 = useRef("");
-  const keyTimer                  = useRef(null);
-
-  const showToast = (msg) => {
+  const keyBuffer   = useRef("");
+  const keyTimer    = useRef(null);
+  const pollTimer   = useRef(null);
+  const loadingRef  = useRef(false);
+  const showToast = useCallback((msg) => {
     setToast(msg);
     setTimeout(() => setToast(""), 2800);
-  };
+  }, []);
 
+  // Update a single photo in state by id
+  const patchPhoto = useCallback((updated) => {
+    setPhotos(prev => prev.map(p => p.id === updated.id ? updated : p));
+  }, []);
+
+  // ── Main load ────────────────────────────────────────────────────────────
   const load = useCallback(async (force = false) => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setStatus("loading");
     setErrMsg("");
+
     try {
-      const cached = force ? [] : getCached();
-      const cachedIds = new Set(cached.map((p) => p.id));
+      // 1. Restore from cache instantly → stable skeleton grid with correct aspect ratios
+      const cached    = force ? [] : getCached();
+      const cachedIds = new Set(cached.map(p => p.id));
+
       if (cached.length > 0) {
-        setPhotos(cached.map((p) => ({ ...p, url: null })));
+        setPhotos(cached.map(p => ({ ...p, thumbUrl: null, url: null })));
         setStatus("resolving");
       }
-      const offset = force ? 0 : getStoredOffset();
-      const updates = await fetchUpdates(offset);
-      const newPhotos = [];
-      let maxId = offset;
-      for (const u of updates) {
-        if (u.update_id >= maxId) maxId = u.update_id + 1;
-        const post = u.channel_post;
-        if (!post?.photo) continue;
-        if (CHANNEL_ID && String(post.chat.id) !== String(CHANNEL_ID)) continue;
-        if (cachedIds.has(post.message_id) && !force) continue;
-        const largest = post.photo[post.photo.length - 1];
-        newPhotos.push({ id: post.message_id, file_id: largest.file_id, caption: post.caption || "", date: new Date(post.date * 1000), url: null });
-      }
-      if (maxId > offset) saveOffset(maxId);
+
+      // 2. Pull all available Telegram updates (no offset = nothing ever deleted from server)
+      const updates   = await fetchUpdates();
+      const newPhotos = parsePhotosFromUpdates(updates, force ? new Set() : cachedIds);
+
+      // 3. Merge + sort
       const seen = new Set();
-      const merged = [...newPhotos, ...cached.map((p) => ({ ...p, url: null }))]
-        .filter((p) => { if (seen.has(p.id)) return false; seen.add(p.id); return true; })
+      const merged = [...newPhotos, ...cached.map(p => ({ ...p, thumbUrl: null, url: null }))]
+        .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return true; })
         .sort((a, b) => new Date(b.date) - new Date(a.date));
+
       saveCached(merged);
       setPhotos(merged);
       if (!merged.length) { setStatus("done"); return; }
       setStatus("resolving");
-      await resolveBatch(merged, (u) => setPhotos([...u]));
+
+      // 4. Resolve each photo independently in parallel → patch as each completes
+      //    Above-fold (first 8) fire immediately; rest get a tiny stagger to avoid throttling
+      await Promise.all(
+        merged.map((photo, i) =>
+          new Promise(resolve => {
+            const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
+            setTimeout(() => resolvePhoto(photo, patchPhoto).then(resolve), delay);
+          })
+        )
+      );
+
       setStatus("done");
     } catch (e) {
       setErrMsg(e.message);
       setStatus("error");
+    } finally {
+      loadingRef.current = false;
     }
-  }, []);
+  }, [patchPhoto]);
+
+  // ── Silent poll ──────────────────────────────────────────────────────────
+  const silentPoll = useCallback(async () => {
+    if (loadingRef.current) return;
+    try {
+      const updates   = await fetchUpdates();
+      const cached    = getCached();
+      const newPhotos = parsePhotosFromUpdates(updates, new Set(cached.map(p => p.id)));
+      if (!newPhotos.length) return;
+
+      const seen = new Set();
+      const merged = [...newPhotos, ...cached.map(p => ({ ...p, thumbUrl: null, url: null }))]
+        .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return true; })
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+      saveCached(merged);
+      setPhotos(merged);
+      showToast(`${newPhotos.length} new photo${newPhotos.length > 1 ? "s" : ""} added`);
+
+      // Resolve new photos immediately
+      await Promise.all(newPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
+      setStatus("done");
+    } catch {}
+  }, [patchPhoto, showToast]);
 
   useEffect(() => { load(); }, [load]);
-
-  // Secret code listener
   useEffect(() => {
-    const handler = (e) => {
+    pollTimer.current = setInterval(silentPoll, POLL_MS);
+    return () => clearInterval(pollTimer.current);
+  }, [silentPoll]);
+
+  // ── Secret code ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    const h = (e) => {
       if (["INPUT","TEXTAREA","SELECT"].includes(e.target.tagName)) return;
-      keyBuffer.current += e.key.toUpperCase();
-      if (keyBuffer.current.length > SECRET_CODE.length)
-        keyBuffer.current = keyBuffer.current.slice(-SECRET_CODE.length);
+      keyBuffer.current = (keyBuffer.current + e.key.toUpperCase()).slice(-SECRET.length);
       clearTimeout(keyTimer.current);
       keyTimer.current = setTimeout(() => { keyBuffer.current = ""; }, 1800);
-      if (keyBuffer.current === SECRET_CODE) {
-        keyBuffer.current = "";
-        setSettings((s) => !s);
-        setResetDone(false);
-      }
+      if (keyBuffer.current === SECRET) { keyBuffer.current = ""; setSettings(s => !s); setResetDone(false); }
     };
-    window.addEventListener("keydown", handler);
-    return () => { window.removeEventListener("keydown", handler); clearTimeout(keyTimer.current); };
+    window.addEventListener("keydown", h);
+    return () => { window.removeEventListener("keydown", h); clearTimeout(keyTimer.current); };
   }, []);
 
-  // Lightbox keyboard nav
+  // ── Lightbox keyboard nav ────────────────────────────────────────────────
+  const visiblePhotos = photos.filter(p => p.url && p.url !== "error");
   useEffect(() => {
-    const vis = photos.filter((p) => p.url && p.url !== "error");
     const h = (e) => {
-      if (settings) return;
-      if (lightbox === null) return;
-      if (e.key === "Escape") setLightbox(null);
-      if (e.key === "ArrowRight") { setLbReady(false); setLightbox((i) => Math.min(i + 1, vis.length - 1)); }
-      if (e.key === "ArrowLeft")  { setLbReady(false); setLightbox((i) => Math.max(i - 1, 0)); }
+      if (settings || lightbox === null) return;
+      if (e.key === "Escape")      setLightbox(null);
+      if (e.key === "ArrowRight")  { setLbReady(false); setLightbox(i => Math.min(i + 1, visiblePhotos.length - 1)); }
+      if (e.key === "ArrowLeft")   { setLbReady(false); setLightbox(i => Math.max(i - 1, 0)); }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [lightbox, photos, settings]);
+  }, [lightbox, visiblePhotos.length, settings]);
 
-  const handleResetGallery = () => {
-    try { localStorage.removeItem(CACHE_KEY); localStorage.removeItem(OFFSET_KEY); } catch {}
-    setPhotos([]);
-    setResetDone(true);
-    showToast("Gallery cache cleared.");
-    setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 1200);
+  const handleReset = () => {
+    try { localStorage.removeItem(CACHE_KEY); urlCache.clear(); } catch {}
+    setPhotos([]); setResetDone(true); showToast("Gallery reset.");
+    setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 1000);
   };
 
-  const visiblePhotos = photos.filter((p) => p.url && p.url !== "error");
-  const lbPhoto = lightbox !== null ? visiblePhotos[lightbox] : null;
+  const lbPhoto   = lightbox !== null ? visiblePhotos[lightbox] : null;
   const isWorking = status === "loading" || status === "resolving";
-
-  const openLb = (i) => { setLbReady(false); setLightbox(i); };
-  const navLb  = (d) => { setLbReady(false); setLightbox((i) => Math.max(0, Math.min(visiblePhotos.length - 1, i + d))); };
+  const openLb    = (i) => { setLbReady(false); setLightbox(i); };
+  const navLb     = (d) => { setLbReady(false); setLightbox(i => Math.max(0, Math.min(visiblePhotos.length - 1, i + d))); };
 
   return (
     <>
@@ -189,250 +308,185 @@ export default function LeosPOV() {
         @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Outfit:wght@300;400;500&display=swap');
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        html {
-          width: 100%;
-          height: 100%;
-          background: #090d14;
-          -webkit-text-size-adjust: 100%;
-        }
-
-        body {
-          width: 100%;
-          min-height: 100%;
-          background: #090d14;
-          margin: 0;
-          padding: 0;
-        }
-
-        #root, [data-reactroot] {
-          width: 100%;
-          min-height: 100vh;
-        }
+        html, body { width: 100%; min-height: 100%; background: #090d14; -webkit-text-size-adjust: 100%; }
+        #root, [data-reactroot] { width: 100%; min-height: 100vh; }
 
         :root {
-          --bg:       #090d14;
-          --surface:  #0f1520;
-          --surface2: #141c2a;
-          --border:   #1e2a3a;
-          --border2:  #243040;
-          --white:    #f0f2f5;
-          --grey:     #8a9ab0;
-          --grey-dim: #4a5568;
-          --red-dim:  rgba(192,57,43,0.12);
-          --sans:     'Outfit', sans-serif;
-          --display:  'Bebas Neue', sans-serif;
+          --bg:      #090d14;
+          --surface: #0f1520;
+          --surf2:   #141c2a;
+          --border:  #1e2a3a;
+          --bord2:   #243040;
+          --white:   #f0f2f5;
+          --grey:    #8a9ab0;
+          --dim:     #4a5568;
+          --sans:    'Outfit', sans-serif;
+          --disp:    'Bebas Neue', sans-serif;
         }
 
-        .pf {
-          width: 100%;
-          min-height: 100vh;
-          background: var(--bg);
-          color: var(--white);
-          font-family: var(--sans);
-          display: flex;
-          flex-direction: column;
-        }
+        .pf { width: 100%; min-height: 100vh; background: var(--bg); color: var(--white); font-family: var(--sans); display: flex; flex-direction: column; }
 
-        /* ── NAV ── */
-        .pf-nav {
-          width: 100%;
-          position: sticky; top: 0; z-index: 100;
-          background: rgba(9,13,20,0.92);
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-          border-bottom: 1px solid var(--border);
-          padding: 0 48px; height: 60px;
-          display: flex; align-items: center; justify-content: flex-end; gap: 20px;
-        }
-        @media (max-width: 560px) { .pf-nav { padding: 0 18px; height: 54px; } }
+        /* NAV */
+        .pf-nav { width: 100%; position: sticky; top: 0; z-index: 100; background: rgba(9,13,20,0.92); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--border); padding: 0 48px; height: 60px; display: flex; align-items: center; justify-content: flex-end; gap: 16px; }
+        @media (max-width: 560px) { .pf-nav { padding: 0 18px; height: 52px; } }
 
-        .pf-nav-right { display: flex; align-items: center; gap: 16px; }
         .pf-socials { display: flex; align-items: center; gap: 2px; }
-
-        .pf-social-link {
-          display: flex; align-items: center; justify-content: center;
-          width: 34px; height: 34px;
-          color: var(--grey-dim); text-decoration: none; border-radius: 6px;
-          transition: color 0.18s, background 0.18s;
-          -webkit-tap-highlight-color: transparent;
-        }
+        .pf-social-link { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; color: var(--dim); text-decoration: none; border-radius: 6px; transition: color .18s, background .18s; -webkit-tap-highlight-color: transparent; }
         .pf-social-link:hover { color: var(--white); background: var(--surface); }
 
-        .pf-btn {
-          background: none; border: 1px solid var(--border); color: var(--grey);
-          padding: 6px 14px; font-family: var(--sans); font-size: 0.7rem;
-          font-weight: 400; letter-spacing: 0.08em; cursor: pointer;
-          transition: border-color 0.18s, color 0.18s, background 0.18s;
-          white-space: nowrap; -webkit-tap-highlight-color: transparent; border-radius: 4px;
-        }
+        .pf-btn { background: none; border: 1px solid var(--border); color: var(--grey); padding: 6px 14px; font-family: var(--sans); font-size: .7rem; font-weight: 400; letter-spacing: .08em; cursor: pointer; border-radius: 4px; transition: border-color .18s, color .18s, background .18s; white-space: nowrap; -webkit-tap-highlight-color: transparent; }
         .pf-btn:hover:not(:disabled) { border-color: var(--grey); color: var(--white); background: var(--surface); }
-        .pf-btn:disabled { opacity: 0.3; cursor: default; }
+        .pf-btn:disabled { opacity: .3; cursor: default; }
 
-        /* ── HERO ── */
-        .pf-hero {
-          width: 100%;
-          padding: 52px 48px 40px;
-          display: flex; flex-direction: column; align-items: center; justify-content: center;
-          text-align: center; gap: 8px;
-          border-bottom: 1px solid var(--border);
-        }
+        .pf-live { display: flex; align-items: center; gap: 6px; font-size: .65rem; letter-spacing: .1em; color: var(--dim); }
+        .pf-live-dot { width: 6px; height: 6px; border-radius: 50%; background: #3a7d44; flex-shrink: 0; animation: live 2.5s ease-in-out infinite; }
+        @keyframes live { 0%{box-shadow:0 0 0 0 rgba(58,125,68,.55)} 60%{box-shadow:0 0 0 5px rgba(58,125,68,0)} 100%{box-shadow:0 0 0 0 rgba(58,125,68,0)} }
+
+        /* HERO */
+        .pf-hero { width: 100%; padding: 52px 48px 40px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 8px; border-bottom: 1px solid var(--border); }
         @media (max-width: 560px) { .pf-hero { padding: 36px 18px 28px; } }
+        .pf-eyebrow { font-size: .64rem; font-weight: 500; letter-spacing: .28em; text-transform: uppercase; color: var(--dim); }
+        .pf-title   { font-family: var(--disp); font-size: clamp(3.8rem, 9vw, 7.5rem); letter-spacing: .04em; line-height: .9; color: var(--white); }
+        .pf-photo-count { font-size: .72rem; color: var(--dim); font-weight: 300; margin-top: 6px; }
 
-        .pf-hero-eyebrow { font-size: 0.64rem; font-weight: 500; letter-spacing: 0.28em; text-transform: uppercase; color: var(--grey-dim); }
-        .pf-hero-title { font-family: var(--display); font-size: clamp(3.8rem, 9vw, 7.5rem); letter-spacing: 0.04em; line-height: 0.9; color: var(--white); }
-        .pf-count { font-size: 0.72rem; color: var(--grey-dim); font-weight: 300; margin-top: 6px; }
-
-        /* ── GRID ── */
-        .pf-grid {
-          width: 100%;
-          padding: 20px 48px 72px;
-          columns: 3; column-gap: 8px;
-        }
+        /* GRID */
+        .pf-grid { width: 100%; padding: 20px 48px 72px; columns: 3; column-gap: 8px; }
         @media (max-width: 860px) { .pf-grid { columns: 2; } }
         @media (max-width: 560px) { .pf-grid { columns: 2; padding: 12px 10px 60px; column-gap: 6px; } }
 
-        .pf-cell { break-inside: avoid; margin-bottom: 8px; position: relative; overflow: hidden; background: var(--surface); display: block; cursor: pointer; }
+        /* CELL */
+        .pf-cell { break-inside: avoid; margin-bottom: 8px; position: relative; overflow: hidden; background: var(--surface); display: block; }
         @media (max-width: 560px) { .pf-cell { margin-bottom: 6px; } }
 
-        .pf-cell img { width: 100%; height: auto; display: block; opacity: 0; transition: opacity 0.3s ease, transform 0.45s cubic-bezier(0.25,0.46,0.45,0.94); }
-        .pf-cell img.img-loaded { opacity: 1; }
-        .pf-cell:hover img { transform: scale(1.04); }
-
-        .pf-overlay {
-          position: absolute; inset: 0;
-          background: linear-gradient(to top, rgba(9,13,20,0.7) 0%, transparent 55%);
-          opacity: 0; transition: opacity 0.22s;
-          display: flex; align-items: flex-end; padding: 12px 13px; pointer-events: none;
+        /* Image layers */
+        .pf-img {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          display: block;
+          opacity: 0;
         }
+        /* Thumbnail: blurred placeholder, shown until full loads */
+        .pf-thumb        { filter: blur(12px); transform: scale(1.06); transition: opacity .25s ease; z-index: 1; }
+        .pf-thumb.loaded { opacity: 1; }
+
+        /* Full res: fades in sharp on top */
+        .pf-full        { filter: none; transform: none; transition: opacity .35s ease; z-index: 2; }
+        .pf-full.loaded { opacity: 1; }
+
+        /* Hover zoom only on the full layer */
+        .pf-cell:hover .pf-full { transform: scale(1.04); transition: opacity .35s ease, transform .5s cubic-bezier(.25,.46,.45,.94); }
+
+        /* Caption overlay */
+        .pf-overlay { position: absolute; inset: 0; z-index: 3; background: linear-gradient(to top, rgba(9,13,20,.72) 0%, transparent 52%); opacity: 0; transition: opacity .22s; display: flex; align-items: flex-end; padding: 12px 13px; pointer-events: none; }
         .pf-cell:hover .pf-overlay { opacity: 1; }
-        .pf-cap { font-size: 0.78rem; font-weight: 300; color: rgba(240,242,245,0.88); line-height: 1.4; transform: translateY(4px); opacity: 0; transition: opacity 0.22s, transform 0.22s; }
+        .pf-cap { font-size: .78rem; font-weight: 300; color: rgba(240,242,245,.9); line-height: 1.4; transform: translateY(4px); opacity: 0; transition: opacity .22s, transform .22s; }
         .pf-cell:hover .pf-cap { opacity: 1; transform: translateY(0); }
 
-        .pf-skel { padding-top: 128%; background: linear-gradient(90deg, var(--surface) 25%, #162030 50%, var(--surface) 75%); background-size: 200% 100%; animation: shimmer 1.8s infinite; }
+        /* Shimmer skeleton */
+        .pf-skel { position: absolute; inset: 0; background: linear-gradient(90deg, var(--surface) 25%, #162030 50%, var(--surface) 75%); background-size: 200% 100%; animation: shimmer 1.6s infinite; }
         @keyframes shimmer { to { background-position: -200% 0; } }
 
-        /* ── States ── */
-        .pf-state {
-          width: 100%;
-          flex: 1;
-          display: flex; flex-direction: column; align-items: center; justify-content: center;
-          gap: 12px; text-align: center;
-          padding: 80px 48px;
-          min-height: 40vh;
-        }
-        .pf-state-h { font-family: var(--display); font-size: 1.6rem; letter-spacing: 0.08em; color: var(--grey-dim); }
+        /* States */
+        .pf-state { width: 100%; flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; padding: 80px 48px; min-height: 40vh; }
+        .pf-state-h   { font-family: var(--disp); font-size: 1.6rem; letter-spacing: .08em; color: var(--dim); }
         .pf-state-bar { width: 28px; height: 1px; background: var(--border); }
-        .pf-state-p { font-size: 0.76rem; font-weight: 300; color: var(--grey-dim); line-height: 1.9; }
+        .pf-state-p   { font-size: .76rem; font-weight: 300; color: var(--dim); line-height: 1.9; }
 
-        .pf-dots { position: fixed; bottom: 22px; right: 24px; display: flex; gap: 4px; opacity: 0.5; z-index: 50; }
-        .pf-dot { width: 3px; height: 3px; border-radius: 50%; background: var(--grey); animation: pulse 1.1s ease-in-out infinite; }
-        .pf-dot:nth-child(2) { animation-delay: 0.18s; }
-        .pf-dot:nth-child(3) { animation-delay: 0.36s; }
-        @keyframes pulse { 0%,100%{ opacity:0.2; transform:scale(0.7); } 50%{ opacity:1; transform:scale(1); } }
+        /* Dots */
+        .pf-dots { position: fixed; bottom: 22px; right: 24px; display: flex; gap: 4px; opacity: .5; z-index: 50; }
+        .pf-dot  { width: 3px; height: 3px; border-radius: 50%; background: var(--grey); animation: pulse 1.1s ease-in-out infinite; }
+        .pf-dot:nth-child(2) { animation-delay: .18s; }
+        .pf-dot:nth-child(3) { animation-delay: .36s; }
+        @keyframes pulse { 0%,100%{opacity:.2;transform:scale(.7)} 50%{opacity:1;transform:scale(1)} }
 
-        /* ── Lightbox ── */
-        .pf-lb { position: fixed; inset: 0; z-index: 800; background: rgba(6,9,14,0.97); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 52px 72px 46px; animation: fade-in 0.18s; }
+        /* LIGHTBOX */
+        .pf-lb { position: fixed; inset: 0; z-index: 800; background: rgba(6,9,14,.97); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 52px 72px 46px; animation: fadein .18s; }
         @media (max-width: 560px) { .pf-lb { padding: 52px 6px 50px; } }
-        @keyframes fade-in { from { opacity: 0; } }
-
+        @keyframes fadein { from { opacity: 0; } }
         .pf-lb-wrap { flex: 1; display: flex; align-items: center; justify-content: center; width: 100%; position: relative; min-height: 0; }
-        .pf-lb img { max-width: 100%; max-height: calc(100dvh - 120px); object-fit: contain; display: block; opacity: 0; transition: opacity 0.25s; }
+        .pf-lb img  { max-width: 100%; max-height: calc(100dvh - 120px); object-fit: contain; display: block; opacity: 0; transition: opacity .25s; }
         .pf-lb img.lb-ready { opacity: 1; }
-        .pf-lb-spin { position: absolute; width: 20px; height: 20px; border: 1.5px solid var(--border); border-top-color: var(--grey); border-radius: 50%; animation: spin 0.7s linear infinite; }
+        .pf-lb-spin { position: absolute; width: 20px; height: 20px; border: 1.5px solid var(--border); border-top-color: var(--grey); border-radius: 50%; animation: spin .7s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .pf-lb-close { position: fixed; top: 16px; right: 22px; background: none; border: none; font-family: var(--sans); font-size: 0.68rem; font-weight: 400; letter-spacing: 0.12em; color: var(--grey-dim); cursor: pointer; padding: 8px; transition: color 0.15s; -webkit-tap-highlight-color: transparent; }
+        .pf-lb-close  { position: fixed; top: 16px; right: 22px; background: none; border: none; font-family: var(--sans); font-size: .68rem; letter-spacing: .12em; color: var(--dim); cursor: pointer; padding: 8px; transition: color .15s; -webkit-tap-highlight-color: transparent; }
         .pf-lb-close:hover { color: var(--white); }
-        .pf-lb-prev, .pf-lb-next { position: fixed; top: 50%; transform: translateY(-50%); background: none; border: none; font-family: var(--display); font-size: 2.4rem; color: var(--grey-dim); cursor: pointer; padding: 16px 20px; line-height: 1; transition: color 0.15s; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
-        .pf-lb-prev { left: 0; }
-        .pf-lb-next { right: 0; }
+        .pf-lb-prev, .pf-lb-next { position: fixed; top: 50%; transform: translateY(-50%); background: none; border: none; font-family: var(--disp); font-size: 2.4rem; color: var(--dim); cursor: pointer; padding: 16px 20px; line-height: 1; transition: color .15s; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+        .pf-lb-prev { left: 0; }  .pf-lb-next { right: 0; }
         .pf-lb-prev:hover:not(:disabled), .pf-lb-next:hover:not(:disabled) { color: var(--white); }
-        .pf-lb-prev:disabled, .pf-lb-next:disabled { opacity: 0.12; cursor: default; }
+        .pf-lb-prev:disabled, .pf-lb-next:disabled { opacity: .12; cursor: default; }
         .pf-lb-footer { width: 100%; display: flex; justify-content: space-between; align-items: center; padding-top: 12px; border-top: 1px solid var(--border); margin-top: 12px; flex-shrink: 0; }
-        .pf-lb-cap { font-size: 0.82rem; font-weight: 300; color: var(--grey); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 68%; }
-        .pf-lb-idx { font-size: 0.67rem; font-weight: 500; letter-spacing: 0.12em; color: var(--grey-dim); flex-shrink: 0; }
+        .pf-lb-cap { font-size: .82rem; font-weight: 300; color: var(--grey); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 68%; }
+        .pf-lb-idx { font-size: .67rem; font-weight: 500; letter-spacing: .12em; color: var(--dim); flex-shrink: 0; }
 
-        /* ── Footer ── */
+        /* FOOTER */
         .pf-footer { width: 100%; margin-top: auto; border-top: 1px solid var(--border); padding: 22px 48px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
         @media (max-width: 560px) { .pf-footer { padding: 18px; flex-direction: column; gap: 12px; text-align: center; } }
-        .pf-footer-name { font-family: var(--display); font-size: 1rem; letter-spacing: 0.1em; color: var(--grey-dim); }
-        .pf-footer-copy { font-size: 0.68rem; font-weight: 300; color: var(--grey-dim); letter-spacing: 0.04em; }
+        .pf-footer-name { font-family: var(--disp); font-size: 1rem; letter-spacing: .1em; color: var(--dim); }
+        .pf-footer-copy { font-size: .68rem; font-weight: 300; color: var(--dim); }
         .pf-footer-socials { display: flex; gap: 2px; }
 
-        /* ── Settings Modal ── */
-        .pf-settings-overlay {
-          position: fixed; inset: 0; z-index: 900;
-          background: rgba(4,7,12,0.88);
-          backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
-          display: flex; align-items: center; justify-content: center; padding: 24px;
-          animation: fade-in 0.2s;
-        }
-        .pf-settings-panel {
-          background: var(--surface); border: 1px solid var(--border2);
-          width: 100%; max-width: 420px; overflow: hidden;
-          animation: panel-in 0.22s cubic-bezier(0.16,1,0.3,1);
-        }
-        @keyframes panel-in { from { opacity:0; transform:translateY(10px) scale(0.98); } }
+        /* SETTINGS */
+        .pf-sett-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(4,7,12,.88); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 24px; animation: fadein .2s; }
+        .pf-sett-panel   { background: var(--surface); border: 1px solid var(--bord2); width: 100%; max-width: 420px; overflow: hidden; animation: panelin .22s cubic-bezier(.16,1,.3,1); }
+        @keyframes panelin { from { opacity:0; transform:translateY(10px) scale(.98); } }
+        .pf-sett-hdr  { padding: 20px 24px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+        .pf-sett-tw   { display: flex; align-items: center; gap: 10px; }
+        .pf-sett-ico  { color: var(--dim); display: flex; align-items: center; }
+        .pf-sett-ttl  { font-family: var(--disp); font-size: 1.05rem; letter-spacing: .14em; color: var(--white); }
+        .pf-sett-bdg  { font-size: .58rem; font-weight: 500; letter-spacing: .18em; text-transform: uppercase; color: var(--dim); background: var(--surf2); border: 1px solid var(--border); padding: 2px 7px; border-radius: 2px; }
+        .pf-sett-x    { background: none; border: none; color: var(--dim); cursor: pointer; padding: 4px; font-size: 1rem; line-height: 1; transition: color .15s; -webkit-tap-highlight-color: transparent; }
+        .pf-sett-x:hover { color: var(--white); }
+        .pf-sett-body { padding: 20px 24px 24px; display: flex; flex-direction: column; gap: 14px; }
+        .pf-sett-row  { background: var(--surf2); border: 1px solid var(--border); padding: 16px 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+        .pf-sett-lbl  { font-size: .8rem; font-weight: 500; color: var(--white); margin-bottom: 4px; }
+        .pf-sett-desc { font-size: .7rem; font-weight: 300; color: var(--dim); line-height: 1.6; }
+        .pf-sett-act  { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+        .pf-stat      { font-size: .68rem; color: var(--dim); } .pf-stat strong { color: var(--grey); font-weight: 500; }
+        .pf-btn-danger  { background: rgba(192,57,43,.12); border: 1px solid rgba(192,57,43,.3); color: #e05a4e; padding: 7px 16px; font-family: var(--sans); font-size: .72rem; font-weight: 500; letter-spacing: .06em; cursor: pointer; transition: background .18s,border-color .18s,color .18s; border-radius: 4px; -webkit-tap-highlight-color: transparent; }
+        .pf-btn-danger:hover:not(:disabled) { background: rgba(192,57,43,.22); border-color: rgba(192,57,43,.55); color: #f07060; }
+        .pf-btn-danger:disabled { opacity: .4; cursor: default; }
+        .pf-btn-ok { background: rgba(39,174,96,.12); border: 1px solid rgba(39,174,96,.3); color: #4ec882; padding: 7px 16px; font-family: var(--sans); font-size: .72rem; font-weight: 500; letter-spacing: .06em; border-radius: 4px; cursor: default; }
+        .pf-sett-div  { height: 1px; background: var(--border); }
+        .pf-sett-hint { font-size: .64rem; font-weight: 300; color: var(--dim); text-align: center; letter-spacing: .06em; line-height: 1.7; opacity: .6; }
 
-        .pf-settings-header { padding: 20px 24px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-        .pf-settings-title-wrap { display: flex; align-items: center; gap: 10px; }
-        .pf-settings-icon { color: var(--grey-dim); display: flex; align-items: center; }
-        .pf-settings-title { font-family: var(--display); font-size: 1.05rem; letter-spacing: 0.14em; color: var(--white); }
-        .pf-settings-badge { font-size: 0.58rem; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; color: var(--grey-dim); background: var(--surface2); border: 1px solid var(--border); padding: 2px 7px; border-radius: 2px; }
-        .pf-settings-close { background: none; border: none; color: var(--grey-dim); cursor: pointer; padding: 4px; font-size: 1rem; line-height: 1; transition: color 0.15s; -webkit-tap-highlight-color: transparent; }
-        .pf-settings-close:hover { color: var(--white); }
-        .pf-settings-body { padding: 20px 24px 24px; display: flex; flex-direction: column; gap: 14px; }
-        .pf-settings-section { background: var(--surface2); border: 1px solid var(--border); padding: 16px 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-        .pf-settings-section-label { font-size: 0.8rem; font-weight: 500; color: var(--white); letter-spacing: 0.04em; margin-bottom: 4px; }
-        .pf-settings-section-desc { font-size: 0.7rem; font-weight: 300; color: var(--grey-dim); line-height: 1.6; }
-        .pf-settings-action { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
-        .pf-stat { font-size: 0.68rem; color: var(--grey-dim); text-align: right; }
-        .pf-stat strong { color: var(--grey); font-weight: 500; }
-
-        .pf-btn-danger { background: rgba(192,57,43,0.12); border: 1px solid rgba(192,57,43,0.3); color: #e05a4e; padding: 7px 16px; font-family: var(--sans); font-size: 0.72rem; font-weight: 500; letter-spacing: 0.06em; cursor: pointer; transition: background 0.18s, border-color 0.18s, color 0.18s; white-space: nowrap; -webkit-tap-highlight-color: transparent; border-radius: 4px; }
-        .pf-btn-danger:hover:not(:disabled) { background: rgba(192,57,43,0.22); border-color: rgba(192,57,43,0.55); color: #f07060; }
-        .pf-btn-danger:disabled { opacity: 0.4; cursor: default; }
-        .pf-btn-success { background: rgba(39,174,96,0.12); border: 1px solid rgba(39,174,96,0.3); color: #4ec882; padding: 7px 16px; font-family: var(--sans); font-size: 0.72rem; font-weight: 500; letter-spacing: 0.06em; border-radius: 4px; cursor: default; }
-
-        .pf-settings-divider { height: 1px; background: var(--border); }
-        .pf-settings-hint { font-size: 0.64rem; font-weight: 300; color: var(--grey-dim); text-align: center; letter-spacing: 0.06em; line-height: 1.7; opacity: 0.6; }
-
-        /* ── Toast ── */
-        .pf-toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%); z-index: 1000; background: var(--surface2); border: 1px solid var(--border2); color: var(--white); font-size: 0.76rem; font-weight: 400; letter-spacing: 0.04em; padding: 10px 22px; white-space: nowrap; animation: toast-in 0.22s cubic-bezier(0.16,1,0.3,1); pointer-events: none; }
-        @keyframes toast-in { from { opacity:0; transform: translateX(-50%) translateY(8px); } }
+        /* TOAST */
+        .pf-toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%); z-index: 1000; background: var(--surf2); border: 1px solid var(--bord2); color: var(--white); font-size: .76rem; padding: 10px 22px; white-space: nowrap; pointer-events: none; animation: toast-in .22s cubic-bezier(.16,1,.3,1); }
+        @keyframes toast-in { from { opacity:0; transform:translateX(-50%) translateY(8px); } }
       `}</style>
 
       <div className="pf">
 
-        {/* ── NAV ── */}
+        {/* NAV */}
         <nav className="pf-nav">
-          <div className="pf-nav-right">
-            <div className="pf-socials">
-              <a className="pf-social-link" href="https://www.facebook.com/ragingkamote12" target="_blank" rel="noopener noreferrer" aria-label="Facebook"><FacebookIcon /></a>
-              <a className="pf-social-link" href="https://www.tiktok.com/@leojcb09?is_from_webapp=1&sender_device=pc" target="_blank" rel="noopener noreferrer" aria-label="TikTok"><TikTokIcon /></a>
-              <a className="pf-social-link" href="https://www.instagram.com/leonjcb09/" target="_blank" rel="noopener noreferrer" aria-label="Instagram"><InstagramIcon /></a>
-            </div>
-            <button className="pf-btn" onClick={() => load(true)} disabled={isWorking}>
-              {status === "loading" ? "loading…" : "↺ refresh"}
-            </button>
+          <div className="pf-socials">
+            <a className="pf-social-link" href="https://www.facebook.com/ragingkamote12"                              target="_blank" rel="noopener noreferrer" aria-label="Facebook"><FacebookIcon /></a>
+            <a className="pf-social-link" href="https://www.tiktok.com/@leojcb09?is_from_webapp=1&sender_device=pc"  target="_blank" rel="noopener noreferrer" aria-label="TikTok"><TikTokIcon /></a>
+            <a className="pf-social-link" href="https://www.instagram.com/leonjcb09/"                                target="_blank" rel="noopener noreferrer" aria-label="Instagram"><InstagramIcon /></a>
           </div>
+          <div className="pf-live"><span className="pf-live-dot" /><span>live</span></div>
+          <button className="pf-btn" onClick={() => { urlCache.clear(); load(true); }} disabled={isWorking}>
+            {status === "loading" ? "loading…" : "↺ refresh"}
+          </button>
         </nav>
 
-        {/* ── HERO ── */}
+        {/* HERO */}
         <div className="pf-hero">
-          <p className="pf-hero-eyebrow">Photography Portfolio</p>
-          <h1 className="pf-hero-title">Leo's POV</h1>
+          <p className="pf-eyebrow">Photography Portfolio</p>
+          <h1 className="pf-title">Leo's POV</h1>
           {visiblePhotos.length > 0 && (
-            <span className="pf-count">{visiblePhotos.length} photo{visiblePhotos.length !== 1 ? "s" : ""}</span>
+            <span className="pf-photo-count">{visiblePhotos.length} photo{visiblePhotos.length !== 1 ? "s" : ""}</span>
           )}
         </div>
 
-        {/* ── Loading ── */}
+        {/* Loading */}
         {status === "loading" && photos.length === 0 && (
           <div className="pf-state"><p className="pf-state-h">Loading…</p></div>
         )}
 
-        {/* ── Error ── */}
+        {/* Error */}
         {status === "error" && (
           <div className="pf-state">
             <p className="pf-state-h">Failed to load</p>
@@ -442,7 +496,7 @@ export default function LeosPOV() {
           </div>
         )}
 
-        {/* ── Empty ── */}
+        {/* Empty */}
         {status === "done" && photos.length === 0 && (
           <div className="pf-state">
             <p className="pf-state-h">No Photos Yet</p>
@@ -451,50 +505,45 @@ export default function LeosPOV() {
           </div>
         )}
 
-        {/* ── Grid ── */}
+        {/* Grid */}
         {photos.length > 0 && (
           <main className="pf-grid">
             {photos.map((photo, i) => {
-              const hasUrl = photo.url && photo.url !== "error";
-              const visIdx = visiblePhotos.findIndex((p) => p.id === photo.id);
+              const visIdx = visiblePhotos.findIndex(p => p.id === photo.id);
               return (
-                <div key={photo.id} className="pf-cell" onClick={() => hasUrl && openLb(visIdx)} style={{ cursor: hasUrl ? "pointer" : "default" }}>
-                  {hasUrl ? (
-                    <>
-                      <img src={photo.url} alt={photo.caption || `Photo ${i + 1}`} loading={i < 6 ? "eager" : "lazy"} decoding="async" onLoad={(e) => e.currentTarget.classList.add("img-loaded")} />
-                      <div className="pf-overlay">{photo.caption && <p className="pf-cap">{photo.caption}</p>}</div>
-                    </>
-                  ) : (
-                    <div className="pf-skel" />
-                  )}
-                </div>
+                <PhotoCell
+                  key={photo.id}
+                  photo={photo}
+                  index={i}
+                  onClick={() => visIdx >= 0 && openLb(visIdx)}
+                />
               );
             })}
           </main>
         )}
 
-        {/* ── Resolving dots ── */}
+        {/* Resolving indicator */}
         {status === "resolving" && (
-          <div className="pf-dots"><div className="pf-dot" /><div className="pf-dot" /><div className="pf-dot" /></div>
+          <div className="pf-dots"><div className="pf-dot"/><div className="pf-dot"/><div className="pf-dot"/></div>
         )}
 
-        {/* ── Footer ── */}
+        {/* Footer */}
         <footer className="pf-footer">
           <span className="pf-footer-name">LEO'S POV</span>
           <span className="pf-footer-copy">© {new Date().getFullYear()} All rights reserved</span>
           <div className="pf-footer-socials">
-            <a className="pf-social-link" href="https://www.facebook.com/ragingkamote12" target="_blank" rel="noopener noreferrer" aria-label="Facebook"><FacebookIcon /></a>
+            <a className="pf-social-link" href="https://www.facebook.com/ragingkamote12"                             target="_blank" rel="noopener noreferrer" aria-label="Facebook"><FacebookIcon /></a>
             <a className="pf-social-link" href="https://www.tiktok.com/@leojcb09?is_from_webapp=1&sender_device=pc" target="_blank" rel="noopener noreferrer" aria-label="TikTok"><TikTokIcon /></a>
-            <a className="pf-social-link" href="https://www.instagram.com/leonjcb09/" target="_blank" rel="noopener noreferrer" aria-label="Instagram"><InstagramIcon /></a>
+            <a className="pf-social-link" href="https://www.instagram.com/leonjcb09/"                               target="_blank" rel="noopener noreferrer" aria-label="Instagram"><InstagramIcon /></a>
           </div>
         </footer>
 
-        {/* ── Lightbox ── */}
+        {/* Lightbox */}
         {lightbox !== null && lbPhoto && (
-          <div className="pf-lb" onClick={(e) => e.currentTarget === e.target && setLightbox(null)}>
+          <div className="pf-lb" onClick={e => e.currentTarget === e.target && setLightbox(null)}>
             <button className="pf-lb-close" onClick={() => setLightbox(null)}>✕ close</button>
             <button className="pf-lb-prev" onClick={() => navLb(-1)} disabled={lightbox === 0}>‹</button>
-            <button className="pf-lb-next" onClick={() => navLb(1)} disabled={lightbox === visiblePhotos.length - 1}>›</button>
+            <button className="pf-lb-next" onClick={() => navLb(1)}  disabled={lightbox === visiblePhotos.length - 1}>›</button>
             <div className="pf-lb-wrap">
               {!lbReady && <div className="pf-lb-spin" />}
               <img key={lbPhoto.id} src={lbPhoto.url} alt={lbPhoto.caption || ""} className={lbReady ? "lb-ready" : ""} onLoad={() => setLbReady(true)} />
@@ -506,53 +555,40 @@ export default function LeosPOV() {
           </div>
         )}
 
-        {/* ── Secret Settings Modal ── */}
+        {/* Settings */}
         {settings && (
-          <div className="pf-settings-overlay" onClick={(e) => e.currentTarget === e.target && setSettings(false)}>
-            <div className="pf-settings-panel">
-              <div className="pf-settings-header">
-                <div className="pf-settings-title-wrap">
-                  <span className="pf-settings-icon"><GearIcon /></span>
-                  <span className="pf-settings-title">SETTINGS</span>
-                  <span className="pf-settings-badge">Admin</span>
+          <div className="pf-sett-overlay" onClick={e => e.currentTarget === e.target && setSettings(false)}>
+            <div className="pf-sett-panel">
+              <div className="pf-sett-hdr">
+                <div className="pf-sett-tw">
+                  <span className="pf-sett-ico"><GearIcon /></span>
+                  <span className="pf-sett-ttl">SETTINGS</span>
+                  <span className="pf-sett-bdg">Admin</span>
                 </div>
-                <button className="pf-settings-close" onClick={() => setSettings(false)}>✕</button>
+                <button className="pf-sett-x" onClick={() => setSettings(false)}>✕</button>
               </div>
-              <div className="pf-settings-body">
-                <div className="pf-settings-section">
-                  <div>
-                    <p className="pf-settings-section-label">Gallery Cache</p>
-                    <p className="pf-settings-section-desc">Locally cached photo metadata<br />used for instant loading on refresh.</p>
-                  </div>
-                  <div className="pf-settings-action">
-                    <span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""} cached</span>
+              <div className="pf-sett-body">
+                <div className="pf-sett-row">
+                  <div><p className="pf-sett-lbl">Gallery Cache</p><p className="pf-sett-desc">Locally cached photo metadata<br />for instant loading on refresh.</p></div>
+                  <div className="pf-sett-act"><span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""}</span></div>
+                </div>
+                <div className="pf-sett-row">
+                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Clears cache and re-fetches<br />everything from Telegram.</p></div>
+                  <div className="pf-sett-act">
+                    {resetDone
+                      ? <span className="pf-btn-ok">✓ Done</span>
+                      : <button className="pf-btn-danger" onClick={handleReset} disabled={isWorking}>Reset Gallery</button>}
                   </div>
                 </div>
-                <div className="pf-settings-section">
-                  <div>
-                    <p className="pf-settings-section-label">Reset Gallery</p>
-                    <p className="pf-settings-section-desc">Clears all cached photos and<br />re-fetches everything from Telegram.</p>
-                  </div>
-                  <div className="pf-settings-action">
-                    {resetDone ? (
-                      <span className="pf-btn-success">✓ Done</span>
-                    ) : (
-                      <button className="pf-btn-danger" onClick={handleResetGallery} disabled={isWorking}>Reset Gallery</button>
-                    )}
-                  </div>
-                </div>
-                <div className="pf-settings-divider" />
-                <p className="pf-settings-hint">
-                  Press <strong style={{color:"var(--grey-dim)"}}>LJCBSET</strong> anywhere on the page<br />to open or close this panel
-                </p>
+                <div className="pf-sett-div" />
+                <p className="pf-sett-hint">Press <strong style={{color:"var(--grey)"}}>LJCBSET</strong> to toggle this panel</p>
               </div>
             </div>
           </div>
         )}
 
-        {/* ── Toast ── */}
+        {/* Toast */}
         {toast && <div className="pf-toast">{toast}</div>}
-
       </div>
     </>
   );
