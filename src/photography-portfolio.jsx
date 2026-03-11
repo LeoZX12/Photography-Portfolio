@@ -159,6 +159,104 @@ function PhotoCell({ photo, index, onClick }) {
   );
 }
 
+// ─── LightboxViewer: swipe (mobile) + arrow buttons (desktop) ───────────────
+function LightboxViewer({ photos, index, onClose, onNav, lbReady, setLbReady }) {
+  const photo       = photos[index];
+  const wrapRef     = useRef(null);
+  const slideRef    = useRef(null);
+  const touchStart  = useRef(null);
+  const touchDelta  = useRef(0);
+  const dragging    = useRef(false);
+
+  // reset ready state when photo changes
+  useEffect(() => { setLbReady(false); }, [index, setLbReady]);
+
+  // ── Touch swipe handling ──────────────────────────────────────────────────
+  const onTouchStart = (e) => {
+    touchStart.current = e.touches[0].clientX;
+    touchDelta.current = 0;
+    dragging.current   = true;
+  };
+
+  const onTouchMove = (e) => {
+    if (!dragging.current || !slideRef.current) return;
+    const dx = e.touches[0].clientX - touchStart.current;
+    touchDelta.current = dx;
+    // live drag feedback — clamp so it doesn't go too far
+    const clamped = Math.max(-120, Math.min(120, dx));
+    slideRef.current.style.transition = "none";
+    slideRef.current.style.transform  = `translateX(${clamped}px)`;
+  };
+
+  const onTouchEnd = () => {
+    if (!dragging.current || !slideRef.current) return;
+    dragging.current = false;
+    const dx = touchDelta.current;
+    // snap back with animation
+    slideRef.current.style.transition = "";
+    slideRef.current.style.transform  = "";
+
+    const THRESHOLD = 60;
+    if (dx < -THRESHOLD && index < photos.length - 1) onNav(1);
+    else if (dx > THRESHOLD && index > 0)             onNav(-1);
+  };
+
+  // ── Backdrop click to close ───────────────────────────────────────────────
+  const onBackdrop = (e) => { if (e.currentTarget === e.target) onClose(); };
+
+  // Dots — show max 7 around current index
+  const total   = photos.length;
+  const maxDots = 7;
+  const half    = Math.floor(maxDots / 2);
+  let   start   = Math.max(0, index - half);
+  const end     = Math.min(total, start + maxDots);
+  start = Math.max(0, end - maxDots);
+
+  return (
+    <div className="pf-lb" onClick={onBackdrop}>
+      <button className="pf-lb-close" onClick={onClose}>✕ close</button>
+
+      {/* Desktop arrow buttons */}
+      <button className="pf-lb-prev" onClick={() => onNav(-1)} disabled={index === 0}>‹</button>
+      <button className="pf-lb-next" onClick={() => onNav(1)}  disabled={index === photos.length - 1}>›</button>
+
+      {/* Swipeable image area */}
+      <div
+        ref={wrapRef}
+        className="pf-lb-wrap"
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchEnd}
+      >
+        <div ref={slideRef} className="pf-lb-img-slide">
+          {!lbReady && <div className="pf-lb-spin" />}
+          <img
+            key={photo.id}
+            src={photo.url}
+            alt={photo.caption || ""}
+            className={lbReady ? "lb-ready" : ""}
+            onLoad={() => setLbReady(true)}
+          />
+        </div>
+      </div>
+
+      {/* Mobile swipe dots */}
+      <div className="pf-lb-dots">
+        {Array.from({ length: end - start }, (_, i) => (
+          <div key={start + i} className={`pf-lb-dot${start + i === index ? " active" : ""}`} />
+        ))}
+      </div>
+
+      {/* Footer */}
+      <div className="pf-lb-footer">
+        <span className="pf-lb-cap">{photo.caption || ""}</span>
+        <span className="pf-lb-idx">{index + 1} / {total}</span>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Component ───
 export default function LeosPOV() {
   const [photos, setPhotos]       = useState([]);
@@ -412,21 +510,85 @@ export default function LeosPOV() {
         @keyframes pulse { 0%,100%{opacity:.2;transform:scale(.7)} 50%{opacity:1;transform:scale(1)} }
 
         /* LIGHTBOX */
-        .pf-lb { position: fixed; inset: 0; z-index: 800; background: rgba(6,9,14,.97); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 52px 72px 46px; animation: fadein .18s; }
-        @media (max-width: 560px) { .pf-lb { padding: 52px 6px 50px; } }
+        .pf-lb { position: fixed; inset: 0; z-index: 800; background: rgba(6,9,14,.97); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 56px 0 48px; animation: fadein .18s; }
         @keyframes fadein { from { opacity: 0; } }
-        .pf-lb-wrap { flex: 1; display: flex; align-items: center; justify-content: center; width: 100%; position: relative; min-height: 0; }
-        .pf-lb img  { max-width: 100%; max-height: calc(100dvh - 120px); object-fit: contain; display: block; opacity: 0; transition: opacity .25s; }
+
+        /* swipeable image area */
+        .pf-lb-wrap {
+          flex: 1; display: flex; align-items: center; justify-content: center;
+          width: 100%; position: relative; min-height: 0;
+          overflow: hidden;
+          touch-action: pan-y;
+        }
+        .pf-lb-img-slide {
+          display: flex; align-items: center; justify-content: center;
+          width: 100%; height: 100%;
+          transition: transform .28s cubic-bezier(.25,.46,.45,.94);
+          will-change: transform;
+        }
+        .pf-lb img {
+          max-width: calc(100% - 140px);
+          max-height: calc(100dvh - 130px);
+          object-fit: contain; display: block;
+          opacity: 0; transition: opacity .25s;
+          pointer-events: none;
+          user-select: none;
+          -webkit-user-drag: none;
+        }
+        @media (max-width: 560px) {
+          .pf-lb img { max-width: calc(100% - 24px); }
+        }
         .pf-lb img.lb-ready { opacity: 1; }
         .pf-lb-spin { position: absolute; width: 20px; height: 20px; border: 1.5px solid var(--border); border-top-color: var(--grey); border-radius: 50%; animation: spin .7s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .pf-lb-close  { position: fixed; top: 16px; right: 22px; background: none; border: none; font-family: var(--sans); font-size: .68rem; letter-spacing: .12em; color: var(--dim); cursor: pointer; padding: 8px; transition: color .15s; -webkit-tap-highlight-color: transparent; }
+
+        /* close */
+        .pf-lb-close { position: fixed; top: 16px; right: 22px; background: none; border: none; font-family: var(--sans); font-size: .68rem; letter-spacing: .12em; color: var(--dim); cursor: pointer; padding: 8px; transition: color .15s; -webkit-tap-highlight-color: transparent; }
         .pf-lb-close:hover { color: var(--white); }
-        .pf-lb-prev, .pf-lb-next { position: fixed; top: 50%; transform: translateY(-50%); background: none; border: none; font-family: var(--disp); font-size: 2.4rem; color: var(--dim); cursor: pointer; padding: 16px 20px; line-height: 1; transition: color .15s; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
-        .pf-lb-prev { left: 0; }  .pf-lb-next { right: 0; }
-        .pf-lb-prev:hover:not(:disabled), .pf-lb-next:hover:not(:disabled) { color: var(--white); }
-        .pf-lb-prev:disabled, .pf-lb-next:disabled { opacity: .12; cursor: default; }
-        .pf-lb-footer { width: 100%; display: flex; justify-content: space-between; align-items: center; padding-top: 12px; border-top: 1px solid var(--border); margin-top: 12px; flex-shrink: 0; }
+
+        /* desktop arrow buttons */
+        .pf-lb-prev, .pf-lb-next {
+          position: fixed; top: 50%; transform: translateY(-50%);
+          width: 52px; height: 52px;
+          background: rgba(255,255,255,.07);
+          border: 1px solid rgba(255,255,255,.1);
+          border-radius: 50%;
+          display: flex; align-items: center; justify-content: center;
+          font-family: var(--disp); font-size: 1.6rem; color: var(--grey);
+          cursor: pointer; line-height: 1;
+          transition: background .18s, border-color .18s, color .18s, opacity .18s;
+          -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+        }
+        .pf-lb-prev { left: 18px; }
+        .pf-lb-next { right: 18px; }
+        .pf-lb-prev:hover:not(:disabled), .pf-lb-next:hover:not(:disabled) {
+          background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.22); color: var(--white);
+        }
+        .pf-lb-prev:disabled, .pf-lb-next:disabled { opacity: .15; cursor: default; }
+
+        /* hide arrow buttons on touch devices */
+        @media (hover: none) {
+          .pf-lb-prev, .pf-lb-next { display: none; }
+        }
+
+        /* swipe hint dots on mobile */
+        .pf-lb-dots {
+          display: none;
+          gap: 5px;
+          justify-content: center;
+          padding: 6px 0 0;
+        }
+        @media (hover: none) { .pf-lb-dots { display: flex; } }
+        .pf-lb-dot {
+          width: 5px; height: 5px; border-radius: 50%;
+          background: var(--dim); transition: background .2s, transform .2s;
+          flex-shrink: 0;
+        }
+        .pf-lb-dot.active { background: var(--white); transform: scale(1.3); }
+
+        /* footer */
+        .pf-lb-footer { width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 12px 48px 0; border-top: 1px solid var(--border); margin-top: 12px; flex-shrink: 0; }
+        @media (max-width: 560px) { .pf-lb-footer { padding: 10px 16px 0; } }
         .pf-lb-cap { font-size: .82rem; font-weight: 300; color: var(--grey); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 68%; }
         .pf-lb-idx { font-size: .67rem; font-weight: 500; letter-spacing: .12em; color: var(--dim); flex-shrink: 0; }
 
@@ -605,19 +767,14 @@ export default function LeosPOV() {
 
         {/* Lightbox */}
         {lightbox !== null && lbPhoto && (
-          <div className="pf-lb" onClick={e => e.currentTarget === e.target && setLightbox(null)}>
-            <button className="pf-lb-close" onClick={() => setLightbox(null)}>✕ close</button>
-            <button className="pf-lb-prev" onClick={() => navLb(-1)} disabled={lightbox === 0}>‹</button>
-            <button className="pf-lb-next" onClick={() => navLb(1)}  disabled={lightbox === visiblePhotos.length - 1}>›</button>
-            <div className="pf-lb-wrap">
-              {!lbReady && <div className="pf-lb-spin" />}
-              <img key={lbPhoto.id} src={lbPhoto.url} alt={lbPhoto.caption || ""} className={lbReady ? "lb-ready" : ""} onLoad={() => setLbReady(true)} />
-            </div>
-            <div className="pf-lb-footer">
-              <span className="pf-lb-cap">{lbPhoto.caption || ""}</span>
-              <span className="pf-lb-idx">{lightbox + 1} / {visiblePhotos.length}</span>
-            </div>
-          </div>
+          <LightboxViewer
+            photos={visiblePhotos}
+            index={lightbox}
+            onClose={() => setLightbox(null)}
+            onNav={navLb}
+            lbReady={lbReady}
+            setLbReady={setLbReady}
+          />
         )}
 
         {/* Settings */}
