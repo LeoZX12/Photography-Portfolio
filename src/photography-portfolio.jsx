@@ -159,70 +159,114 @@ function PhotoCell({ photo, index, onClick }) {
   );
 }
 
-// ─── LightboxViewer: swipe (mobile) + arrow buttons (desktop) ───────────────
+// ─── LightboxViewer: swipe-horizontal (next/prev), swipe-down (close), backdrop click ───
 function LightboxViewer({ photos, index, onClose, onNav, lbReady, setLbReady }) {
-  const photo       = photos[index];
-  const wrapRef     = useRef(null);
-  const slideRef    = useRef(null);
-  const touchStart  = useRef(null);
-  const touchDelta  = useRef(0);
-  const dragging    = useRef(false);
+  const photo      = photos[index];
+  const slideRef   = useRef(null);
+  const lbRef      = useRef(null);
+  const touchStart = useRef({ x: 0, y: 0 });
+  const touchDelta = useRef({ x: 0, y: 0 });
+  const gesture    = useRef(null); // null | "horizontal" | "vertical"
+  const [dismissing, setDismissing] = useState(false);
 
-  // reset ready state when photo changes
   useEffect(() => { setLbReady(false); }, [index, setLbReady]);
 
-  // ── Touch swipe handling ──────────────────────────────────────────────────
+  // ── Touch ─────────────────────────────────────────────────────────────────
   const onTouchStart = (e) => {
-    touchStart.current = e.touches[0].clientX;
-    touchDelta.current = 0;
-    dragging.current   = true;
+    touchStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    touchDelta.current = { x: 0, y: 0 };
+    gesture.current    = null;
   };
 
   const onTouchMove = (e) => {
-    if (!dragging.current || !slideRef.current) return;
-    const dx = e.touches[0].clientX - touchStart.current;
-    touchDelta.current = dx;
-    // live drag feedback — clamp so it doesn't go too far
-    const clamped = Math.max(-120, Math.min(120, dx));
-    slideRef.current.style.transition = "none";
-    slideRef.current.style.transform  = `translateX(${clamped}px)`;
+    if (!slideRef.current) return;
+    const dx = e.touches[0].clientX - touchStart.current.x;
+    const dy = e.touches[0].clientY - touchStart.current.y;
+    touchDelta.current = { x: dx, y: dy };
+
+    // Lock gesture direction on first significant move
+    if (!gesture.current && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) {
+      gesture.current = Math.abs(dy) > Math.abs(dx) ? "vertical" : "horizontal";
+    }
+
+    if (gesture.current === "horizontal") {
+      const clamped = Math.max(-130, Math.min(130, dx));
+      slideRef.current.style.transition = "none";
+      slideRef.current.style.transform  = `translateX(${clamped}px)`;
+    }
+
+    if (gesture.current === "vertical" && dy > 0) {
+      // drag the whole lightbox down
+      const clamp = Math.min(dy, 280);
+      const scale = 1 - clamp / 1800;
+      const alpha = 1 - clamp / 320;
+      if (lbRef.current) {
+        lbRef.current.style.transition  = "none";
+        lbRef.current.style.transform   = `translateY(${clamp}px)`;
+        lbRef.current.style.opacity     = Math.max(0, alpha);
+      }
+      slideRef.current.style.transition = "none";
+      slideRef.current.style.transform  = `scale(${scale})`;
+    }
   };
 
   const onTouchEnd = () => {
-    if (!dragging.current || !slideRef.current) return;
-    dragging.current = false;
-    const dx = touchDelta.current;
-    // snap back with animation
-    slideRef.current.style.transition = "";
-    slideRef.current.style.transform  = "";
+    if (!slideRef.current) return;
+    const { x: dx, y: dy } = touchDelta.current;
 
-    const THRESHOLD = 60;
-    if (dx < -THRESHOLD && index < photos.length - 1) onNav(1);
-    else if (dx > THRESHOLD && index > 0)             onNav(-1);
+    if (gesture.current === "horizontal") {
+      slideRef.current.style.transition = "";
+      slideRef.current.style.transform  = "";
+      if (dx < -60 && index < photos.length - 1) onNav(1);
+      else if (dx > 60 && index > 0)             onNav(-1);
+    }
+
+    if (gesture.current === "vertical") {
+      if (dy > 110) {
+        // dismiss — fly out downward
+        setDismissing(true);
+        if (lbRef.current) {
+          lbRef.current.style.transition = "transform .28s ease, opacity .28s ease";
+          lbRef.current.style.transform  = "translateY(100%)";
+          lbRef.current.style.opacity    = "0";
+        }
+        setTimeout(onClose, 260);
+      } else {
+        // snap back
+        if (lbRef.current) {
+          lbRef.current.style.transition = "transform .25s ease, opacity .25s ease";
+          lbRef.current.style.transform  = "";
+          lbRef.current.style.opacity    = "";
+        }
+        slideRef.current.style.transition = "";
+        slideRef.current.style.transform  = "";
+      }
+    }
+
+    gesture.current = null;
   };
 
-  // ── Backdrop click to close ───────────────────────────────────────────────
-  const onBackdrop = (e) => { if (e.currentTarget === e.target) onClose(); };
+  // ── Desktop: click dark backdrop to close ─────────────────────────────────
+  const onBackdrop = (e) => {
+    // Close if the click landed directly on the backdrop, not on any child
+    if (e.target === lbRef.current) onClose();
+  };
 
-  // Dots — show max 7 around current index
-  const total   = photos.length;
-  const maxDots = 7;
-  const half    = Math.floor(maxDots / 2);
-  let   start   = Math.max(0, index - half);
-  const end     = Math.min(total, start + maxDots);
+  // Dots
+  const total = photos.length;
+  const maxDots = 7, half = Math.floor(maxDots / 2);
+  let start = Math.max(0, index - half);
+  const end = Math.min(total, start + maxDots);
   start = Math.max(0, end - maxDots);
 
   return (
-    <div className="pf-lb" onClick={onBackdrop}>
+    <div ref={lbRef} className="pf-lb" onClick={onBackdrop}>
       <button className="pf-lb-close" onClick={onClose}>✕ close</button>
 
-      {/* Desktop arrow buttons */}
       <button className="pf-lb-prev" onClick={() => onNav(-1)} disabled={index === 0}>‹</button>
       <button className="pf-lb-next" onClick={() => onNav(1)}  disabled={index === photos.length - 1}>›</button>
 
-      {/* Swipeable image area */}
       <div
-        ref={wrapRef}
         className="pf-lb-wrap"
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
@@ -241,14 +285,12 @@ function LightboxViewer({ photos, index, onClose, onNav, lbReady, setLbReady }) 
         </div>
       </div>
 
-      {/* Mobile swipe dots */}
       <div className="pf-lb-dots">
         {Array.from({ length: end - start }, (_, i) => (
           <div key={start + i} className={`pf-lb-dot${start + i === index ? " active" : ""}`} />
         ))}
       </div>
 
-      {/* Footer */}
       <div className="pf-lb-footer">
         <span className="pf-lb-cap">{photo.caption || ""}</span>
         <span className="pf-lb-idx">{index + 1} / {total}</span>
@@ -400,8 +442,9 @@ export default function LeosPOV() {
 
   const handleReset = () => {
     try { localStorage.removeItem(CACHE_KEY); urlCache.clear(); } catch {}
-    setPhotos([]); setResetDone(true); showToast("Gallery reset.");
-    setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 1000);
+    loadingRef.current = false;   // unlock in case a prior load is stuck
+    setPhotos([]); setStatus("idle"); setResetDone(true); showToast("Gallery reset.");
+    setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 800);
   };
 
   const lbPhoto   = lightbox !== null ? visiblePhotos[lightbox] : null;
