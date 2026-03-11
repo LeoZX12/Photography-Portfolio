@@ -345,7 +345,8 @@ export default function LeosPOV() {
   const [lbReady, setLbReady]     = useState(false);
   const [settings, setSettings]   = useState(false);
   const [resetDone, setResetDone]   = useState(false);
-  const [deleteAllDone, setDeleteAllDone] = useState(false);
+  const [deleteAllDone, setDeleteAllDone]     = useState(false);
+  const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [toast, setToast]         = useState("");
   const [newPrompt, setNewPrompt]   = useState(null);
   const [deletionMode, setDeletionMode]   = useState(false);
@@ -511,23 +512,27 @@ export default function LeosPOV() {
 
   const handleReset = () => {
     try {
-      // Permanently wipe ALL stored data — cache, deleted list, url memory
+      // Only clear the display cache + url memory — deleted blacklist is preserved
       localStorage.removeItem(CACHE_KEY);
-      localStorage.removeItem(DELETED_KEY);
       urlCache.clear();
     } catch {}
     loadingRef.current = false;
     setPhotos([]);
     setStatus("idle");
     setResetDone(true);
-    showToast("All images wiped. Re-fetching…");
+    showToast("Re-fetching gallery…");
     setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 800);
   };
 
   const handleDeleteAll = () => {
     try {
+      // Blacklist every currently known photo ID so they never come back after refresh
+      const allPhotos = getCached();
+      const blacklist = getDeleted();
+      allPhotos.forEach(p => blacklist.add(p.id));
+      saveDeleted(blacklist);
+      // Now wipe the display cache and url memory
       localStorage.removeItem(CACHE_KEY);
-      localStorage.removeItem(DELETED_KEY);
       urlCache.clear();
     } catch {}
     loadingRef.current = false;
@@ -589,6 +594,7 @@ export default function LeosPOV() {
         .pf-eyebrow { font-size: .64rem; font-weight: 500; letter-spacing: .28em; text-transform: uppercase; color: var(--dim); }
         .pf-title   { font-family: var(--disp); font-size: clamp(3.8rem, 9vw, 7.5rem); letter-spacing: .04em; line-height: .9; color: var(--white); }
         .pf-photo-count { font-size: .72rem; color: var(--dim); font-weight: 300; margin-top: 6px; }
+        .pf-bio { font-size: .78rem; font-weight: 300; color: var(--grey); line-height: 1.7; letter-spacing: .02em; margin-top: 4px; max-width: 420px; }
 
         /* GRID */
         .pf-grid { width: 100%; padding: 20px 48px 72px; columns: 3; column-gap: 8px; }
@@ -904,6 +910,7 @@ export default function LeosPOV() {
         <div className="pf-hero">
           <p className="pf-eyebrow">Photography Portfolio</p>
           <h1 className="pf-title">Leo's POV</h1>
+          <p className="pf-bio">Street photographer based in the Philippines —<br />capturing raw moments, ordinary lives, and the quiet poetry of everyday streets.</p>
           {visiblePhotos.length > 0 && (
             <span className="pf-photo-count">{visiblePhotos.length} photo{visiblePhotos.length !== 1 ? "s" : ""}</span>
           )}
@@ -1007,7 +1014,7 @@ export default function LeosPOV() {
                   <div className="pf-sett-act"><span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""}</span></div>
                 </div>
                 <div className="pf-sett-row">
-                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Wipes cached photos and re-fetches.<br />Previously deleted photos stay deleted.</p></div>
+                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Clears local cache and re-fetches.<br />Optimizes storage. Deleted photos stay gone.</p></div>
                   <div className="pf-sett-act">
                     {resetDone
                       ? <span className="pf-btn-ok">✓ Done</span>
@@ -1032,12 +1039,27 @@ export default function LeosPOV() {
                 <div className="pf-sett-row">
                   <div>
                     <p className="pf-sett-lbl">Delete All Images</p>
-                    <p className="pf-sett-desc">Permanently removes all photos<br />from this device. Cannot be undone.</p>
+                    <p className="pf-sett-desc">
+                      {deleteAllConfirm
+                        ? <span style={{color:"#e05a4e"}}>This cannot be undone. Are you sure?</span>
+                        : <>Permanently removes all photos<br />from this device. Cannot be undone.</>}
+                    </p>
                   </div>
-                  <div className="pf-sett-act">
-                    {deleteAllDone
-                      ? <span className="pf-btn-ok">✓ Deleted</span>
-                      : <button className="pf-btn-danger" onClick={handleDeleteAll} disabled={isWorking}>Delete All</button>}
+                  <div className="pf-sett-act" style={{gap:6,display:"flex",flexDirection:"column",alignItems:"flex-end"}}>
+                    {deleteAllDone ? (
+                      <span className="pf-btn-ok">✓ Deleted</span>
+                    ) : deleteAllConfirm ? (
+                      <>
+                        <button className="pf-btn-danger" onClick={() => { handleDeleteAll(); setDeleteAllConfirm(false); }} disabled={isWorking}>
+                          Yes, Delete All
+                        </button>
+                        <button className="pf-btn" style={{fontSize:".65rem",padding:"4px 10px"}} onClick={() => setDeleteAllConfirm(false)}>
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button className="pf-btn-danger" onClick={() => setDeleteAllConfirm(true)} disabled={isWorking}>Delete All</button>
+                    )}
                   </div>
                 </div>
                 <div className="pf-sett-div" />
