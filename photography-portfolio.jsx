@@ -364,16 +364,20 @@ export default function LeosPOV() {
   const statusDot  = scanning ? "#3a3a3a" : syncStatus === "live" ? "#2e2e2e" : "#1a1a1a";
 
   return (
-    <div style={{ minHeight: "100vh", width: "100%", background: "#050505", color: "#fff" }}>
+    <div style={{ minHeight: "100vh", width: "100vw", maxWidth: "100vw", overflowX: "hidden", background: "#050505", color: "#fff" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@300;400&family=DM+Sans:wght@300;400&display=swap');
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+        html, body {
+          width: 100%;
+          max-width: 100%;
+          overflow-x: hidden;
+        }
         html {
           overflow-y: scroll;
           scrollbar-gutter: stable;
-          overflow-x: hidden;
           -webkit-text-size-adjust: 100%;
           text-size-adjust: 100%;
         }
@@ -588,7 +592,7 @@ export default function LeosPOV() {
           </h1>
 
           <p className="dms" style={{ fontSize: "13px", color: "rgba(255,255,255,0.45)", lineHeight: 1.8, maxWidth: "360px", margin: "0 auto clamp(20px,3vw,32px)", fontWeight: 300 }}>
-            Capturing moments, crafting stories.<br />Every frame is a point of view.
+            I’m a street photographer based in the Philippines, capturing everyday life as it naturally unfolds.<br />Through my photos, I aim to document the raw emotions, colors, and rhythms that make life in the Philippines beautifully authentic.
           </p>
 
           {/* Socials row */}
@@ -667,7 +671,7 @@ export default function LeosPOV() {
 
       {/* ── Empty / unconfigured ────────────────────────────────────────────── */}
       {!loading && images.length === 0 && configured && (
-        <div style={{ width: "100%", paddingTop: "80px", paddingBottom: "100px", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center" }}>
+        <div className="gx" style={{ width: "100%", boxSizing: "border-box", paddingTop: "80px", paddingBottom: "100px", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center" }}>
           <p className="bb" style={{ fontSize: "clamp(36px,8vw,56px)", color: "#111", textTransform: "uppercase" }}>No frames yet.</p>
           <p className="dm" style={{ fontSize: "11px", color: "#1c1c1c", marginTop: "12px", letterSpacing: "0.08em", lineHeight: 1.9 }}>
             Post photos to your Telegram channel<br />and they'll appear here within seconds.
@@ -675,7 +679,7 @@ export default function LeosPOV() {
         </div>
       )}
       {!loading && !configured && !showSettings && (
-        <div style={{ width: "100%", paddingTop: "80px", textAlign: "center" }}>
+        <div className="gx" style={{ width: "100%", boxSizing: "border-box", paddingTop: "80px", paddingBottom: "100px", textAlign: "center" }}>
           <p className="bb" style={{ fontSize: "clamp(36px,8vw,56px)", color: "#111", textTransform: "uppercase" }}>Not configured.</p>
         </div>
       )}
