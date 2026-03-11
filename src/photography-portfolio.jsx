@@ -7,6 +7,7 @@ const CACHE_KEY   = "tg_leos_pov_v3";
 const DELETED_KEY = "tg_leos_pov_deleted_v1"; // persisted set of removed message IDs
 const SECRET     = "LJCBSET";
 const POLL_MS    = 20000;
+const PAGE_SIZE  = 50;
 
 // ─── In-memory URL cache (survives re-renders, not page reload – Telegram URLs expire) ───
 const urlCache = new Map();
@@ -196,6 +197,146 @@ function PhotoCell({ photo, index, onClick, deletionMode, onDelete }) {
   );
 }
 
+
+// ─── EXIF Reader ─────────────────────────────────────────────────────────────
+// Reads JPEG binary EXIF from a URL (first 128KB is enough for EXIF headers).
+// Handles both little-endian (II) and big-endian (MM) TIFF byte orders.
+// Returns null if no EXIF is found or fetch fails.
+
+function readUint16(v, o, le) { return le ? v.getUint16(o, true) : v.getUint16(o, false); }
+function readUint32(v, o, le) { return le ? v.getUint32(o, true) : v.getUint32(o, false); }
+
+function readAscii(v, offset, length) {
+  let s = "";
+  for (let i = 0; i < length; i++) {
+    const c = v.getUint8(offset + i);
+    if (c === 0) break;
+    s += String.fromCharCode(c);
+  }
+  return s.trim();
+}
+
+function readRational(v, offset, le) {
+  const num = readUint32(v, offset, le);
+  const den = readUint32(v, offset + 4, le);
+  return den === 0 ? 0 : num / den;
+}
+
+function parseIFD(v, ifdOffset, tiffStart, le) {
+  const tags = {};
+  try {
+    const count = readUint16(v, ifdOffset, le);
+    for (let i = 0; i < count; i++) {
+      const entryOffset = ifdOffset + 2 + i * 12;
+      const tag  = readUint16(v, entryOffset, le);
+      const type = readUint16(v, entryOffset + 2, le);
+      const num  = readUint32(v, entryOffset + 4, le);
+      const valOffset = entryOffset + 8;
+
+      // ASCII string
+      if (type === 2) {
+        const strOffset = num > 4 ? tiffStart + readUint32(v, valOffset, le) : valOffset;
+        tags[tag] = readAscii(v, strOffset, num);
+      }
+      // SHORT (uint16)
+      else if (type === 3) {
+        tags[tag] = readUint16(v, valOffset, le);
+      }
+      // LONG (uint32)
+      else if (type === 4) {
+        tags[tag] = readUint32(v, valOffset, le);
+      }
+      // RATIONAL (2×uint32)
+      else if (type === 5) {
+        const rOffset = tiffStart + readUint32(v, valOffset, le);
+        tags[tag] = readRational(v, rOffset, le);
+      }
+      // SRATIONAL (signed)
+      else if (type === 10) {
+        const rOffset = tiffStart + readUint32(v, valOffset, le);
+        const num2 = v.getInt32(rOffset, le);
+        const den2 = v.getInt32(rOffset + 4, le);
+        tags[tag] = den2 === 0 ? 0 : num2 / den2;
+      }
+    }
+  } catch {}
+  return tags;
+}
+
+async function readExif(url) {
+  try {
+    const res = await fetch(url, { headers: { Range: "bytes=0-131071" } });
+    const buf = await res.arrayBuffer();
+    const v   = new DataView(buf);
+
+    // Verify JPEG SOI marker
+    if (v.getUint8(0) !== 0xFF || v.getUint8(1) !== 0xD8) return null;
+
+    // Scan for APP1 (0xFFE1) marker
+    let pos = 2;
+    while (pos < buf.byteLength - 4) {
+      const marker = v.getUint16(pos);
+      const segLen = v.getUint16(pos + 2);
+
+      if (marker === 0xFFE1) {
+        // Check for "Exif\0\0"
+        const exifHeader = readAscii(v, pos + 4, 4);
+        if (exifHeader === "Exif") {
+          const tiffStart = pos + 10;
+
+          // TIFF byte order
+          const byteOrder = v.getUint16(tiffStart);
+          const le = byteOrder === 0x4949; // II = little-endian
+
+          // TIFF magic + IFD0 offset
+          const ifd0Offset = tiffStart + readUint32(v, tiffStart + 4, le);
+          const ifd0 = parseIFD(v, ifd0Offset, tiffStart, le);
+
+          // Follow ExifIFD pointer (tag 0x8769)
+          let exifTags = {};
+          if (ifd0[0x8769]) {
+            const exifIfdOffset = tiffStart + ifd0[0x8769];
+            exifTags = parseIFD(v, exifIfdOffset, tiffStart, le);
+          }
+
+          // Extract values
+          const make         = (ifd0[0x010F] || "").replace(/ /g, "").trim();
+          const model        = (ifd0[0x0110] || "").replace(/ /g, "").trim();
+          const focalLen     = exifTags[0x920A] || null;
+          const fNumber      = exifTags[0x829D] || null;
+          const expTime      = exifTags[0x829A] || null;
+          const iso          = exifTags[0x8827] || null;
+          const lensMake     = (exifTags[0xA433] || "").trim();
+          const lensModel    = (exifTags[0xA434] || "").trim();
+
+          if (!make && !model && !focalLen && !iso) return null;
+
+          // Format camera name — strip redundant make prefix from model
+          let camera = model;
+          if (make && !model.toUpperCase().startsWith(make.toUpperCase().split(" ")[0])) {
+            camera = `${model} ${make}`;
+          }
+          camera = camera || make;
+
+          // Format specs
+          const specs = [
+            focalLen  ? `${Math.round(focalLen)}mm`         : null,
+            fNumber   ? `f/${fNumber % 1 === 0 ? fNumber : fNumber.toFixed(1)}` : null,
+            expTime   ? (expTime >= 1 ? `${expTime}s` : `1/${Math.round(1 / expTime)}s`) : null,
+            iso       ? `ISO${iso}`                          : null,
+          ].filter(Boolean).join(" • ");
+
+          return { camera, specs, lens: lensModel || null };
+        }
+      }
+
+      if (segLen < 2) break;
+      pos += 2 + segLen;
+    }
+  } catch {}
+  return null;
+}
+
 // ─── LightboxViewer: swipe-horizontal (next/prev), swipe-down (close), backdrop click ───
 function LightboxViewer({ photos, index, onClose, onNav, lbReady, setLbReady }) {
   const photo      = photos[index];
@@ -205,8 +346,21 @@ function LightboxViewer({ photos, index, onClose, onNav, lbReady, setLbReady }) 
   const touchDelta = useRef({ x: 0, y: 0 });
   const gesture    = useRef(null); // null | "horizontal" | "vertical"
   const [dismissing, setDismissing] = useState(false);
+  const [exif, setExif]           = useState(null);
+  const [exifLoading, setExifLoading] = useState(false);
 
   useEffect(() => { setLbReady(false); }, [index, setLbReady]);
+
+  // Read EXIF from image binary whenever photo changes
+  useEffect(() => {
+    if (!photo?.url || photo.url === "error") { setExif(null); return; }
+    setExif(null);
+    setExifLoading(true);
+    readExif(photo.url)
+      .then(data => { setExif(data); })
+      .catch(() => { setExif(null); })
+      .finally(() => setExifLoading(false));
+  }, [photo?.url]);
 
   // ── Touch ─────────────────────────────────────────────────────────────────
   const onTouchStart = (e) => {
@@ -332,6 +486,26 @@ function LightboxViewer({ photos, index, onClose, onNav, lbReady, setLbReady }) 
         <span className="pf-lb-cap">{photo.caption || ""}</span>
         <span className="pf-lb-idx">{index + 1} / {total}</span>
       </div>
+
+      {/* EXIF strip */}
+      {(exif || exifLoading) && (
+        <div className="pf-lb-exif">
+          {exifLoading && !exif && (
+            <span className="pf-lb-exif-loading">reading exif…</span>
+          )}
+          {exif && exif.camera && (
+            <span className="pf-lb-exif-camera">
+              Shot on <strong>{exif.camera}</strong>
+            </span>
+          )}
+          {exif && exif.lens && (
+            <span className="pf-lb-exif-lens">{exif.lens}</span>
+          )}
+          {exif && exif.specs && (
+            <span className="pf-lb-exif-specs">{exif.specs}</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -345,10 +519,12 @@ export default function LeosPOV() {
   const [lbReady, setLbReady]     = useState(false);
   const [settings, setSettings]   = useState(false);
   const [resetDone, setResetDone]   = useState(false);
-  const [deleteAllDone, setDeleteAllDone] = useState(false);
+  const [deleteAllDone, setDeleteAllDone]     = useState(false);
+  const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [toast, setToast]         = useState("");
   const [newPrompt, setNewPrompt]   = useState(null);
   const [deletionMode, setDeletionMode]   = useState(false);
+  const [page, setPage]                   = useState(0);
   const keyBuffer   = useRef("");
   const keyTimer    = useRef(null);
   const pollTimer   = useRef(null);
@@ -386,7 +562,14 @@ export default function LeosPOV() {
       const cachedIds = new Set(cached.map(p => p.id));
 
       if (cached.length > 0) {
-        setPhotos(cached.map(p => ({ ...p, thumbUrl: null, url: null })));
+        // Show cached skeletons immediately — but preserve any in-memory resolved URLs
+        setPhotos(prev => {
+          const prevMap = new Map(prev.map(p => [p.id, p]));
+          return cached.map(p => {
+            const existing = prevMap.get(p.id);
+            return existing?.url ? existing : { ...p, thumbUrl: null, url: null };
+          });
+        });
         setStatus("resolving");
       }
 
@@ -409,7 +592,15 @@ export default function LeosPOV() {
         .sort((a, b) => new Date(b.date) - new Date(a.date));
 
       saveCached(merged);
-      setPhotos(merged);
+      // Merge in any already-resolved URLs so images don't flicker on reload
+      setPhotos(prev => {
+        const prevMap = new Map(prev.map(p => [p.id, p]));
+        return merged.map(p => {
+          const existing = prevMap.get(p.id);
+          return (existing?.url && existing.url !== "error") ? existing : p;
+        });
+      });
+      setPage(0); // reset to first page on (re)load
       if (!merged.length) { setStatus("done"); return; }
       setStatus("resolving");
 
@@ -439,7 +630,10 @@ export default function LeosPOV() {
     try {
       const updates   = await fetchUpdates();
       const cached    = getCached();
-      const { photos: newPhotos, deletedIds } = parsePhotosFromUpdates(updates, new Set(cached.map(p => p.id)));
+      // skipIds = cached IDs + permanently deleted IDs
+      // Without deleted IDs, deleted photos would re-appear as "new" every poll
+      const skipIds   = new Set([...cached.map(p => p.id), ...getDeleted()]);
+      const { photos: newPhotos, deletedIds } = parsePhotosFromUpdates(updates, skipIds);
 
       // Apply #deleted caption changes
       const deleted = getDeleted();
@@ -459,13 +653,26 @@ export default function LeosPOV() {
         .sort((a, b) => new Date(b.date) - new Date(a.date));
 
       saveCached(merged);
-      setPhotos(merged);
+
+      // Preserve already-resolved URLs for photos already in state
+      // so the grid doesn't go blank during a poll update
+      setPhotos(prev => {
+        const prevMap = new Map(prev.map(p => [p.id, p]));
+        return merged.map(p => {
+          const existing = prevMap.get(p.id);
+          if (existing?.url && existing.url !== "error") return existing;
+          return p;
+        });
+      });
 
       if (deletedCount > 0) showToast(`${deletedCount} photo${deletedCount > 1 ? "s" : ""} permanently deleted`);
       if (newPhotos.length > 0) setNewPrompt({ count: newPhotos.length });
 
-      // Resolve new photos immediately
-      await Promise.all(newPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
+      // Only resolve photos that don't have a URL yet (new arrivals)
+      const toResolve = merged.filter(p => !p.url || p.url === "error");
+      if (toResolve.length > 0) {
+        await Promise.all(toResolve.map(photo => resolvePhoto(photo, patchPhoto)));
+      }
       setStatus("done");
     } catch {}
   }, [patchPhoto, showToast]);
@@ -498,36 +705,49 @@ export default function LeosPOV() {
 
   // ── Lightbox keyboard nav ────────────────────────────────────────────────
   const visiblePhotos = photos.filter(p => p.url && p.url !== "error");
+  const totalPages   = Math.max(1, Math.ceil(photos.length / PAGE_SIZE));
+  const pagePhotos   = photos.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const pageVisible  = pagePhotos.filter(p => p.url && p.url !== "error");
+
+  const goToPage = (p) => {
+    setPage(p);
+    setLightbox(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
   useEffect(() => {
     const h = (e) => {
       if (settings || lightbox === null) return;
       if (e.key === "Escape")      setLightbox(null);
-      if (e.key === "ArrowRight")  { setLbReady(false); setLightbox(i => Math.min(i + 1, visiblePhotos.length - 1)); }
+      if (e.key === "ArrowRight")  { setLbReady(false); setLightbox(i => Math.min(i + 1, pageVisible.length - 1)); }
       if (e.key === "ArrowLeft")   { setLbReady(false); setLightbox(i => Math.max(i - 1, 0)); }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [lightbox, visiblePhotos.length, settings]);
+  }, [lightbox, pageVisible.length, settings]);
 
   const handleReset = () => {
     try {
-      // Permanently wipe ALL stored data — cache, deleted list, url memory
+      // Only clear the display cache + url memory — deleted blacklist is preserved
       localStorage.removeItem(CACHE_KEY);
-      localStorage.removeItem(DELETED_KEY);
       urlCache.clear();
     } catch {}
     loadingRef.current = false;
     setPhotos([]);
     setStatus("idle");
     setResetDone(true);
-    showToast("All images wiped. Re-fetching…");
+    showToast("Re-fetching gallery…");
     setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 800);
   };
 
   const handleDeleteAll = () => {
     try {
+      // Blacklist every currently known photo ID so they never come back after refresh
+      const allPhotos = getCached();
+      const blacklist = getDeleted();
+      allPhotos.forEach(p => blacklist.add(p.id));
+      saveDeleted(blacklist);
+      // Now wipe the display cache and url memory
       localStorage.removeItem(CACHE_KEY);
-      localStorage.removeItem(DELETED_KEY);
       urlCache.clear();
     } catch {}
     loadingRef.current = false;
@@ -538,10 +758,10 @@ export default function LeosPOV() {
     setTimeout(() => { setSettings(false); setDeleteAllDone(false); }, 1200);
   };
 
-  const lbPhoto   = lightbox !== null ? visiblePhotos[lightbox] : null;
+  const lbPhoto   = lightbox !== null ? pageVisible[lightbox] : null;
   const isWorking = status === "loading" || status === "resolving";
   const openLb    = (i) => { setLbReady(false); setLightbox(i); };
-  const navLb     = (d) => { setLbReady(false); setLightbox(i => Math.max(0, Math.min(visiblePhotos.length - 1, i + d))); };
+  const navLb     = (d) => { setLbReady(false); setLightbox(i => Math.max(0, Math.min(pageVisible.length - 1, i + d))); };
 
   return (
     <>
@@ -589,6 +809,7 @@ export default function LeosPOV() {
         .pf-eyebrow { font-size: .64rem; font-weight: 500; letter-spacing: .28em; text-transform: uppercase; color: var(--dim); }
         .pf-title   { font-family: var(--disp); font-size: clamp(3.8rem, 9vw, 7.5rem); letter-spacing: .04em; line-height: .9; color: var(--white); }
         .pf-photo-count { font-size: .72rem; color: var(--dim); font-weight: 300; margin-top: 6px; }
+        .pf-bio { font-size: .78rem; font-weight: 300; color: var(--grey); line-height: 1.7; letter-spacing: .02em; margin-top: 4px; max-width: 420px; }
 
         /* GRID */
         .pf-grid { width: 100%; padding: 20px 48px 72px; columns: 3; column-gap: 8px; }
@@ -642,6 +863,87 @@ export default function LeosPOV() {
         .pf-dot:nth-child(2) { animation-delay: .18s; }
         .pf-dot:nth-child(3) { animation-delay: .36s; }
         @keyframes pulse { 0%,100%{opacity:.2;transform:scale(.7)} 50%{opacity:1;transform:scale(1)} }
+
+        /* TOP PAGINATION (hero area) */
+        .pf-pag-top {
+          display: flex; align-items: center; gap: 10px;
+          margin-top: 10px;
+        }
+        .pf-pag-top-label {
+          font-family: var(--sans);
+          font-size: .68rem; font-weight: 400;
+          letter-spacing: .1em; text-transform: uppercase;
+          color: var(--dim);
+          min-width: 90px; text-align: center;
+        }
+
+        /* PAGINATION */
+        .pf-pag {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          padding: 16px 48px 48px;
+          flex-shrink: 0;
+        }
+        @media (max-width: 560px) { .pf-pag { padding: 14px 12px 40px; gap: 6px; } }
+
+        .pf-pag-btn {
+          font-family: var(--sans);
+          font-size: .72rem;
+          font-weight: 500;
+          letter-spacing: .08em;
+          text-transform: uppercase;
+          color: var(--grey);
+          background: var(--surf2);
+          border: 1px solid var(--border);
+          padding: 8px 16px;
+          cursor: pointer;
+          transition: color .15s, border-color .15s, background .15s;
+          -webkit-tap-highlight-color: transparent;
+          white-space: nowrap;
+        }
+        .pf-pag-btn:hover:not(:disabled) {
+          color: var(--white);
+          border-color: rgba(255,255,255,.18);
+          background: rgba(255,255,255,.06);
+        }
+        .pf-pag-btn:disabled { opacity: .22; cursor: default; }
+
+        .pf-pag-pages {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .pf-pag-num {
+          font-family: var(--sans);
+          font-size: .7rem;
+          font-weight: 400;
+          letter-spacing: .06em;
+          color: var(--dim);
+          background: none;
+          border: 1px solid transparent;
+          width: 32px; height: 32px;
+          display: flex; align-items: center; justify-content: center;
+          cursor: pointer;
+          transition: color .15s, border-color .15s, background .15s;
+          -webkit-tap-highlight-color: transparent;
+          flex-shrink: 0;
+        }
+        .pf-pag-num:hover { color: var(--white); border-color: var(--border); }
+        .pf-pag-num.active {
+          color: var(--white);
+          border-color: rgba(255,255,255,.22);
+          background: rgba(255,255,255,.07);
+          font-weight: 600;
+        }
+        .pf-pag-ellipsis {
+          color: var(--dim);
+          font-size: .68rem;
+          padding: 0 2px;
+          user-select: none;
+        }
 
         /* LIGHTBOX */
         .pf-lb { position: fixed; inset: 0; z-index: 800; background: rgba(6,9,14,.97); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 56px 0 48px; animation: fadein .18s; }
@@ -725,6 +1027,51 @@ export default function LeosPOV() {
         @media (max-width: 560px) { .pf-lb-footer { padding: 10px 16px 0; } }
         .pf-lb-cap { font-size: .82rem; font-weight: 300; color: var(--grey); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 68%; }
         .pf-lb-idx { font-size: .67rem; font-weight: 500; letter-spacing: .12em; color: var(--dim); flex-shrink: 0; }
+
+        /* EXIF STRIP */
+        .pf-lb-exif {
+          display: flex; flex-direction: column; align-items: center;
+          gap: 3px;
+          padding: 10px 48px 0;
+          width: 100%; flex-shrink: 0;
+          text-align: center;
+          border-top: 1px solid var(--border);
+          margin-top: 10px;
+        }
+        @media (max-width: 560px) { .pf-lb-exif { padding: 8px 16px 0; } }
+        .pf-lb-exif-loading {
+          font-family: var(--sans); font-size: .62rem;
+          color: var(--dim); letter-spacing: .12em;
+          text-transform: uppercase; opacity: .5;
+        }
+        .pf-lb-exif-camera {
+          font-family: var(--sans);
+          font-size: .72rem;
+          font-weight: 300;
+          color: var(--grey);
+          letter-spacing: .03em;
+        }
+        .pf-lb-exif-camera strong {
+          font-weight: 700;
+          color: var(--white);
+          letter-spacing: .04em;
+          text-transform: uppercase;
+          font-size: .73rem;
+        }
+        .pf-lb-exif-lens {
+          font-family: var(--sans);
+          font-size: .64rem;
+          font-weight: 300;
+          color: var(--dim);
+          letter-spacing: .06em;
+        }
+        .pf-lb-exif-specs {
+          font-family: var(--sans);
+          font-size: .65rem;
+          font-weight: 400;
+          color: var(--dim);
+          letter-spacing: .12em;
+        }
 
         /* FOOTER */
         .pf-footer { width: 100%; margin-top: auto; border-top: 1px solid var(--border); padding: 22px 48px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
@@ -904,8 +1251,30 @@ export default function LeosPOV() {
         <div className="pf-hero">
           <p className="pf-eyebrow">Photography Portfolio</p>
           <h1 className="pf-title">Leo's POV</h1>
+          <p className="pf-bio">Street photographer based in the Philippines —<br />capturing raw moments, ordinary lives, and the quiet poetry of everyday streets.</p>
           {visiblePhotos.length > 0 && (
-            <span className="pf-photo-count">{visiblePhotos.length} photo{visiblePhotos.length !== 1 ? "s" : ""}</span>
+            <span className="pf-photo-count">
+              {totalPages > 1
+                ? `Showing ${page * PAGE_SIZE + 1}–${Math.min((page + 1) * PAGE_SIZE, photos.length)} of ${photos.length} photos`
+                : `${visiblePhotos.length} photo${visiblePhotos.length !== 1 ? "s" : ""}`}
+            </span>
+          )}
+
+          {/* Top pagination — prev/next only */}
+          {totalPages > 1 && (
+            <div className="pf-pag-top">
+              <button
+                className="pf-pag-btn"
+                onClick={() => goToPage(page - 1)}
+                disabled={page === 0}
+              >‹ Prev</button>
+              <span className="pf-pag-top-label">Page {page + 1} of {totalPages}</span>
+              <button
+                className="pf-pag-btn"
+                onClick={() => goToPage(page + 1)}
+                disabled={page === totalPages - 1}
+              >Next ›</button>
+            </div>
           )}
         </div>
 
@@ -945,8 +1314,8 @@ export default function LeosPOV() {
         {/* Grid */}
         {photos.length > 0 && (
           <main className="pf-grid">
-            {photos.map((photo, i) => {
-              const visIdx = visiblePhotos.findIndex(p => p.id === photo.id);
+            {pagePhotos.map((photo, i) => {
+              const visIdx = pageVisible.findIndex(p => p.id === photo.id);
               return (
                 <PhotoCell
                   key={photo.id}
@@ -959,6 +1328,53 @@ export default function LeosPOV() {
               );
             })}
           </main>
+        )}
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <nav className="pf-pag">
+            <button
+              className="pf-pag-btn"
+              onClick={() => goToPage(page - 1)}
+              disabled={page === 0}
+              aria-label="Previous page"
+            >
+              ‹ Prev
+            </button>
+
+            <div className="pf-pag-pages">
+              {Array.from({ length: totalPages }, (_, i) => {
+                // Always show first, last, current ±1, and ellipses
+                const show = i === 0 || i === totalPages - 1 ||
+                             Math.abs(i - page) <= 1;
+                const ellipsisBefore = i === totalPages - 1 && page < totalPages - 3;
+                const ellipsisAfter  = i === 0 && page > 2;
+                if (!show) return null;
+                return (
+                  <span key={i}>
+                    {ellipsisBefore && <span className="pf-pag-ellipsis">…</span>}
+                    <button
+                      className={`pf-pag-num${i === page ? " active" : ""}`}
+                      onClick={() => goToPage(i)}
+                      aria-label={`Page ${i + 1}`}
+                    >
+                      {i + 1}
+                    </button>
+                    {ellipsisAfter && <span className="pf-pag-ellipsis">…</span>}
+                  </span>
+                );
+              })}
+            </div>
+
+            <button
+              className="pf-pag-btn"
+              onClick={() => goToPage(page + 1)}
+              disabled={page === totalPages - 1}
+              aria-label="Next page"
+            >
+              Next ›
+            </button>
+          </nav>
         )}
 
         {/* Resolving indicator */}
@@ -980,7 +1396,7 @@ export default function LeosPOV() {
         {/* Lightbox */}
         {lightbox !== null && lbPhoto && (
           <LightboxViewer
-            photos={visiblePhotos}
+            photos={pageVisible}
             index={lightbox}
             onClose={() => setLightbox(null)}
             onNav={navLb}
@@ -1007,7 +1423,7 @@ export default function LeosPOV() {
                   <div className="pf-sett-act"><span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""}</span></div>
                 </div>
                 <div className="pf-sett-row">
-                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Wipes cached photos and re-fetches.<br />Previously deleted photos stay deleted.</p></div>
+                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Clears local cache and re-fetches.<br />Optimizes storage. Deleted photos stay gone.</p></div>
                   <div className="pf-sett-act">
                     {resetDone
                       ? <span className="pf-btn-ok">✓ Done</span>
@@ -1032,12 +1448,27 @@ export default function LeosPOV() {
                 <div className="pf-sett-row">
                   <div>
                     <p className="pf-sett-lbl">Delete All Images</p>
-                    <p className="pf-sett-desc">Permanently removes all photos<br />from this device. Cannot be undone.</p>
+                    <p className="pf-sett-desc">
+                      {deleteAllConfirm
+                        ? <span style={{color:"#e05a4e"}}>This cannot be undone. Are you sure?</span>
+                        : <>Permanently removes all photos<br />from this device. Cannot be undone.</>}
+                    </p>
                   </div>
-                  <div className="pf-sett-act">
-                    {deleteAllDone
-                      ? <span className="pf-btn-ok">✓ Deleted</span>
-                      : <button className="pf-btn-danger" onClick={handleDeleteAll} disabled={isWorking}>Delete All</button>}
+                  <div className="pf-sett-act" style={{gap:6,display:"flex",flexDirection:"column",alignItems:"flex-end"}}>
+                    {deleteAllDone ? (
+                      <span className="pf-btn-ok">✓ Deleted</span>
+                    ) : deleteAllConfirm ? (
+                      <>
+                        <button className="pf-btn-danger" onClick={() => { handleDeleteAll(); setDeleteAllConfirm(false); }} disabled={isWorking}>
+                          Yes, Delete All
+                        </button>
+                        <button className="pf-btn" style={{fontSize:".65rem",padding:"4px 10px"}} onClick={() => setDeleteAllConfirm(false)}>
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button className="pf-btn-danger" onClick={() => setDeleteAllConfirm(true)} disabled={isWorking}>Delete All</button>
+                    )}
                   </div>
                 </div>
                 <div className="pf-sett-div" />
