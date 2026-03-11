@@ -3,7 +3,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 const BOT_TOKEN  = "8662339296:AAEMzUBkgN9nuDLmDgxE93l5IarlGiB0Ikc";
 const CHANNEL_ID = "-1003831838516";
 const API        = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const CACHE_KEY  = "tg_leos_pov_v3";  // bumped so stale offset caches are ignored
+const CACHE_KEY   = "tg_leos_pov_v3";
+const DELETED_KEY = "tg_leos_pov_deleted_v1"; // persisted set of removed message IDs
 const SECRET     = "LJCBSET";
 const POLL_MS    = 20000;
 
@@ -48,12 +49,23 @@ function saveCached(photos) {
 }
 
 
+// ─── Deleted IDs store ───────────────────────────────────────────────────────
+function getDeleted() {
+  try { return new Set(JSON.parse(localStorage.getItem(DELETED_KEY) || "[]")); } catch { return new Set(); }
+}
+function saveDeleted(set) {
+  try { localStorage.setItem(DELETED_KEY, JSON.stringify([...set])); } catch {}
+}
+function addDeleted(id) {
+  const s = getDeleted(); s.add(id); saveDeleted(s);
+}
+
 // ─── Fetch Telegram updates ─────────────────────────────────────────────────
 // We intentionally NEVER pass an offset so Telegram never deletes pending
 // updates. The localStorage cache is the permanent source of truth; getUpdates
 // is only used to discover photos not yet in the cache.
 async function fetchUpdates() {
-  const p = `limit=100&allowed_updates=${encodeURIComponent('["channel_post"]')}`;
+  const p = `limit=100&allowed_updates=${encodeURIComponent('["channel_post","edited_channel_post"]')}`;
   const r = await fetch(`${API}/getUpdates?${p}`);
   if (!r.ok) throw new Error(`Network error ${r.status}`);
   const d = await r.json();
@@ -63,11 +75,24 @@ async function fetchUpdates() {
 
 function parsePhotosFromUpdates(updates, skipIds = new Set()) {
   const photos = [];
+  const deletedIds = new Set(); // IDs permanently deleted via #deleted caption
+
   for (const u of updates) {
+    // Detect #deleted caption edits on existing posts
+    const edited = u.edited_channel_post;
+    if (edited && CHANNEL_ID && String(edited.chat.id) === String(CHANNEL_ID)) {
+      if ((edited.caption || "").toLowerCase().includes("#deleted")) {
+        telegramDeletedIds.add(edited.message_id);
+      }
+    }
+
     const post = u.channel_post;
     if (!post?.photo) continue;
     if (CHANNEL_ID && String(post.chat.id) !== String(CHANNEL_ID)) continue;
     if (skipIds.has(post.message_id)) continue;
+    // Skip if caption already has #deleted
+    if ((post.caption || "").toLowerCase().includes("#deleted")) continue;
+
     const sizes   = post.photo;
     const largest = sizes[sizes.length - 1];
     const thumb   = sizes.find(s => s.width >= 80) || sizes[0];
@@ -83,17 +108,18 @@ function parsePhotosFromUpdates(updates, skipIds = new Set()) {
       url:           null,
     });
   }
-  return photos;
+  return { photos, deletedIds };
 }
 
 // ─── Icons ───
 const FacebookIcon  = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/></svg>;
 const TikTokIcon    = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-2.88 2.5 2.89 2.89 0 0 1-2.89-2.89 2.89 2.89 0 0 1 2.89-2.89c.28 0 .54.04.79.1V9.01a6.33 6.33 0 0 0-.79-.05 6.34 6.34 0 0 0-6.34 6.34 6.34 6.34 0 0 0 6.34 6.34 6.34 6.34 0 0 0 6.33-6.34l-.02-8.38a8.17 8.17 0 0 0 4.79 1.52V5.01a4.85 4.85 0 0 1-1-.32z"/></svg>;
 const InstagramIcon = () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"/><circle cx="12" cy="12" r="5"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>;
+
 const GearIcon      = () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
 
 // ─── PhotoCell: viewport-aware, thumb→full two-phase loader ───
-function PhotoCell({ photo, index, onClick }) {
+function PhotoCell({ photo, index, onClick, deletionMode, onDelete }) {
   const wrapRef      = useRef(null);
   const [visible, setVisible]     = useState(index < 6); // first 6 eager
   const [thumbLoaded, setThumbLoaded] = useState(false);
@@ -119,7 +145,7 @@ function PhotoCell({ photo, index, onClick }) {
   return (
     <div
       ref={wrapRef}
-      className="pf-cell"
+      className={`pf-cell${deletionMode ? " deletion-active" : ""}`}
       onClick={() => hasFull && onClick()}
       style={{ cursor: hasFull ? "pointer" : "default", aspectRatio }}
     >
@@ -154,6 +180,17 @@ function PhotoCell({ photo, index, onClick }) {
         <div className="pf-overlay">
           <p className="pf-cap">{photo.caption}</p>
         </div>
+      )}
+
+      {/* Admin delete button */}
+      {deletionMode && hasFull && (
+        <button
+          className="pf-cell-delete"
+          onClick={e => { e.stopPropagation(); onDelete(photo.id); }}
+          title="Remove from gallery"
+        >
+          ×
+        </button>
       )}
     </div>
   );
@@ -307,9 +344,11 @@ export default function LeosPOV() {
   const [lightbox, setLightbox]   = useState(null);
   const [lbReady, setLbReady]     = useState(false);
   const [settings, setSettings]   = useState(false);
-  const [resetDone, setResetDone] = useState(false);
+  const [resetDone, setResetDone]   = useState(false);
+  const [deleteAllDone, setDeleteAllDone] = useState(false);
   const [toast, setToast]         = useState("");
-  const [newPrompt, setNewPrompt]   = useState(null); // { count, scrollTo }
+  const [newPrompt, setNewPrompt]   = useState(null);
+  const [deletionMode, setDeletionMode]   = useState(false);
   const keyBuffer   = useRef("");
   const keyTimer    = useRef(null);
   const pollTimer   = useRef(null);
@@ -323,6 +362,16 @@ export default function LeosPOV() {
   const patchPhoto = useCallback((updated) => {
     setPhotos(prev => prev.map(p => p.id === updated.id ? updated : p));
   }, []);
+
+  // Remove a photo from cache + deleted set + state
+  const deletePhoto = useCallback((id) => {
+    addDeleted(id);
+    urlCache.delete && urlCache.forEach((v, k) => {}); // keep urlCache intact (file_ids reusable)
+    const updated = getCached().filter(p => p.id !== id);
+    saveCached(updated);
+    setPhotos(prev => prev.filter(p => p.id !== id));
+    showToast("Photo removed from gallery.");
+  }, [showToast]);
 
   // ── Main load ────────────────────────────────────────────────────────────
   const load = useCallback(async (force = false) => {
@@ -343,12 +392,20 @@ export default function LeosPOV() {
 
       // 2. Pull all available Telegram updates (no offset = nothing ever deleted from server)
       const updates   = await fetchUpdates();
-      const newPhotos = parsePhotosFromUpdates(updates, force ? new Set() : cachedIds);
+      const { photos: newPhotos, deletedIds } = parsePhotosFromUpdates(updates, force ? new Set() : cachedIds);
 
-      // 3. Merge + sort
+      // Apply #deleted caption changes + admin deletions
+      const deleted = getDeleted();
+      deletedIds.forEach(id => { deleted.add(id); addDeleted(id); });
+
+      // 3. Merge + sort, filtering out hidden/deleted IDs
       const seen = new Set();
       const merged = [...newPhotos, ...cached.map(p => ({ ...p, thumbUrl: null, url: null }))]
-        .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return true; })
+        .filter(p => {
+          if (seen.has(p.id)) return false;
+          seen.add(p.id);
+          return !deleted.has(p.id);
+        })
         .sort((a, b) => new Date(b.date) - new Date(a.date));
 
       saveCached(merged);
@@ -382,18 +439,30 @@ export default function LeosPOV() {
     try {
       const updates   = await fetchUpdates();
       const cached    = getCached();
-      const newPhotos = parsePhotosFromUpdates(updates, new Set(cached.map(p => p.id)));
-      if (!newPhotos.length) return;
+      const { photos: newPhotos, deletedIds } = parsePhotosFromUpdates(updates, new Set(cached.map(p => p.id)));
 
-      const seen = new Set();
-      const merged = [...newPhotos, ...cached.map(p => ({ ...p, thumbUrl: null, url: null }))]
-        .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return true; })
+      // Apply #deleted caption changes
+      const deleted = getDeleted();
+      let deletedCount = 0;
+      deletedIds.forEach(id => { if (!deleted.has(id)) { deleted.add(id); addDeleted(id); deletedCount++; } });
+
+      if (!newPhotos.length && deletedCount === 0) return;
+
+      const fullCached = getCached();
+      const seenPoll = new Set();
+      const merged = [...newPhotos, ...fullCached.map(p => ({ ...p, thumbUrl: null, url: null }))]
+        .filter(p => {
+          if (seenPoll.has(p.id)) return false;
+          seenPoll.add(p.id);
+          return !deleted.has(p.id);
+        })
         .sort((a, b) => new Date(b.date) - new Date(a.date));
 
       saveCached(merged);
       setPhotos(merged);
-      // Show sticky new-photo prompt (auto-dismiss after 8s)
-      setNewPrompt({ count: newPhotos.length });
+
+      if (deletedCount > 0) showToast(`${deletedCount} photo${deletedCount > 1 ? "s" : ""} permanently deleted`);
+      if (newPhotos.length > 0) setNewPrompt({ count: newPhotos.length });
 
       // Resolve new photos immediately
       await Promise.all(newPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
@@ -441,10 +510,32 @@ export default function LeosPOV() {
   }, [lightbox, visiblePhotos.length, settings]);
 
   const handleReset = () => {
-    try { localStorage.removeItem(CACHE_KEY); urlCache.clear(); } catch {}
-    loadingRef.current = false;   // unlock in case a prior load is stuck
-    setPhotos([]); setStatus("idle"); setResetDone(true); showToast("Gallery reset.");
+    try {
+      // Permanently wipe ALL stored data — cache, deleted list, url memory
+      localStorage.removeItem(CACHE_KEY);
+      localStorage.removeItem(DELETED_KEY);
+      urlCache.clear();
+    } catch {}
+    loadingRef.current = false;
+    setPhotos([]);
+    setStatus("idle");
+    setResetDone(true);
+    showToast("All images wiped. Re-fetching…");
     setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 800);
+  };
+
+  const handleDeleteAll = () => {
+    try {
+      localStorage.removeItem(CACHE_KEY);
+      localStorage.removeItem(DELETED_KEY);
+      urlCache.clear();
+    } catch {}
+    loadingRef.current = false;
+    setPhotos([]);
+    setStatus("done");
+    setDeleteAllDone(true);
+    showToast("All images permanently deleted.");
+    setTimeout(() => { setSettings(false); setDeleteAllDone(false); }, 1200);
   };
 
   const lbPhoto   = lightbox !== null ? visiblePhotos[lightbox] : null;
@@ -666,6 +757,73 @@ export default function LeosPOV() {
         .pf-sett-div  { height: 1px; background: var(--border); }
         .pf-sett-hint { font-size: .64rem; font-weight: 300; color: var(--dim); text-align: center; letter-spacing: .06em; line-height: 1.7; opacity: .6; }
 
+        /* ADMIN DELETE BUTTON ON CELL */
+        .pf-cell-delete {
+          position: absolute;
+          top: 50%; left: 50%;
+          transform: translate(-50%, -50%) scale(0.88);
+          z-index: 10;
+          width: 56px; height: 56px;
+          border-radius: 50%;
+          background: rgba(8,11,18,0.72);
+          border: 2px solid rgba(255,255,255,0.28);
+          color: #fff;
+          font-size: 1.75rem;
+          line-height: 1;
+          display: flex; align-items: center; justify-content: center;
+          cursor: pointer;
+          opacity: 0;
+          transition: opacity .2s, background .15s, transform .2s, border-color .15s;
+          -webkit-tap-highlight-color: transparent;
+          backdrop-filter: blur(10px);
+          padding: 0;
+        }
+        .pf-cell:hover .pf-cell-delete,
+        .pf-cell-delete:focus { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+        .pf-cell-delete:hover { background: rgba(192,57,43,0.88); border-color: rgba(192,57,43,0.6); }
+        .pf-cell-delete:active { transform: translate(-50%, -50%) scale(0.93); }
+        /* Dim overlay on the cell when in deletion mode */
+        .pf-cell.deletion-active::after {
+          content: "";
+          position: absolute; inset: 0;
+          background: rgba(8,11,18,0.38);
+          border-radius: inherit;
+          pointer-events: none;
+          z-index: 5;
+        }
+
+        /* Always visible on touch */
+        @media (hover: none) { .pf-cell-delete { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+
+        /* ADMIN MODE BAR */
+        .pf-del-bar {
+          width: 100%;
+          background: rgba(192,57,43,0.12);
+          border-bottom: 1px solid rgba(192,57,43,0.28);
+          padding: 7px 48px;
+          display: flex; align-items: center; gap: 10px;
+          font-size: .7rem; font-weight: 500;
+          letter-spacing: .1em; text-transform: uppercase;
+          color: #e05a4e;
+        }
+        @media (max-width: 560px) { .pf-del-bar { padding: 7px 18px; } }
+        .pf-del-bar-dot {
+          width: 6px; height: 6px; border-radius: 50%;
+          background: #e05a4e; flex-shrink: 0;
+          animation: live 2.5s ease-in-out infinite;
+        }
+        .pf-del-exit {
+          margin-left: auto;
+          background: none; border: 1px solid rgba(192,57,43,0.4);
+          color: #e05a4e; font-family: var(--sans);
+          font-size: .65rem; letter-spacing: .1em;
+          padding: 3px 10px; cursor: pointer;
+          border-radius: 3px;
+          transition: background .15s;
+          -webkit-tap-highlight-color: transparent;
+        }
+        .pf-del-exit:hover { background: rgba(192,57,43,0.15); }
+
         /* NEW PHOTO PROMPT */
         .pf-new-prompt {
           position: fixed;
@@ -751,6 +909,15 @@ export default function LeosPOV() {
           )}
         </div>
 
+        {/* Deletion Mode Bar */}
+        {deletionMode && (
+          <div className="pf-del-bar">
+            <span className="pf-del-bar-dot" />
+            <span>Deletion Mode — tap trash icon to remove photos</span>
+            <button className="pf-del-exit" onClick={() => setDeletionMode(false)}>Exit</button>
+          </div>
+        )}
+
         {/* Loading */}
         {status === "loading" && photos.length === 0 && (
           <div className="pf-state"><p className="pf-state-h">Loading…</p></div>
@@ -785,7 +952,9 @@ export default function LeosPOV() {
                   key={photo.id}
                   photo={photo}
                   index={i}
-                  onClick={() => visIdx >= 0 && openLb(visIdx)}
+                  onClick={() => !deletionMode && visIdx >= 0 && openLb(visIdx)}
+                  deletionMode={deletionMode}
+                  onDelete={deletePhoto}
                 />
               );
             })}
@@ -838,11 +1007,37 @@ export default function LeosPOV() {
                   <div className="pf-sett-act"><span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""}</span></div>
                 </div>
                 <div className="pf-sett-row">
-                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Clears cache and re-fetches<br />everything from Telegram.</p></div>
+                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Wipes cached photos and re-fetches.<br />Previously deleted photos stay deleted.</p></div>
                   <div className="pf-sett-act">
                     {resetDone
                       ? <span className="pf-btn-ok">✓ Done</span>
                       : <button className="pf-btn-danger" onClick={handleReset} disabled={isWorking}>Reset Gallery</button>}
+                  </div>
+                </div>
+                <div className="pf-sett-row">
+                  <div>
+                    <p className="pf-sett-lbl">Deletion Mode</p>
+                    <p className="pf-sett-desc">Show × button on photos.<br />Tap to permanently remove from gallery.</p>
+                  </div>
+                  <div className="pf-sett-act">
+                    <button
+                      className={deletionMode ? "pf-btn-danger" : "pf-btn"}
+                      style={{ minWidth: 72 }}
+                      onClick={() => { setDeletionMode(m => !m); setSettings(false); }}
+                    >
+                      {deletionMode ? "✓ Active" : "Enable"}
+                    </button>
+                  </div>
+                </div>
+                <div className="pf-sett-row">
+                  <div>
+                    <p className="pf-sett-lbl">Delete All Images</p>
+                    <p className="pf-sett-desc">Permanently removes all photos<br />from this device. Cannot be undone.</p>
+                  </div>
+                  <div className="pf-sett-act">
+                    {deleteAllDone
+                      ? <span className="pf-btn-ok">✓ Deleted</span>
+                      : <button className="pf-btn-danger" onClick={handleDeleteAll} disabled={isWorking}>Delete All</button>}
                   </div>
                 </div>
                 <div className="pf-sett-div" />
