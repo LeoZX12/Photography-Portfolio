@@ -1,11 +1,7 @@
 import PhotographyPortfolio from "./photography-portfolio"
 
 function App() {
-  return (
-    <div>
-      <photography-portfolio />
-    </div>
-  )
+  return <PhotographyPortfolio />
 }
 
 export default App
