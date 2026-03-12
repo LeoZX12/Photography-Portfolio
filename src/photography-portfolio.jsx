@@ -4,7 +4,8 @@ const BOT_TOKEN  = "8662339296:AAEMzUBkgN9nuDLmDgxE93l5IarlGiB0Ikc";
 const CHANNEL_ID = "-1003831838516";
 const API        = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const CACHE_KEY   = "tg_leos_pov_v3";
-const DELETED_KEY = "tg_leos_pov_deleted_v1"; // persisted set of removed message IDs
+const DELETED_KEY = "tg_leos_pov_deleted_v1";
+const OFFSET_KEY  = "tg_leos_pov_offset_v1"; // tracks highest processed update_id
 const SECRET     = "LJCBSET";
 const POLL_MS    = 20000;
 const PAGE_SIZE  = 50;
@@ -61,17 +62,42 @@ function addDeleted(id) {
   const s = getDeleted(); s.add(id); saveDeleted(s);
 }
 
-// ─── Fetch Telegram updates ─────────────────────────────────────────────────
-// We intentionally NEVER pass an offset so Telegram never deletes pending
-// updates. The localStorage cache is the permanent source of truth; getUpdates
-// is only used to discover photos not yet in the cache.
-async function fetchUpdates() {
-  const p = `limit=100&allowed_updates=${encodeURIComponent('["channel_post","edited_channel_post"]')}`;
-  const r = await fetch(`${API}/getUpdates?${p}`);
-  if (!r.ok) throw new Error(`Network error ${r.status}`);
-  const d = await r.json();
-  if (!d.ok) throw new Error(d.description || "Telegram API error");
-  return d.result;
+// ─── Offset helpers ──────────────────────────────────────────────────────────
+function getOffset()   { try { return parseInt(localStorage.getItem(OFFSET_KEY) || "0", 10) || 0; } catch { return 0; } }
+function saveOffset(n) { try { localStorage.setItem(OFFSET_KEY, String(n)); } catch {} }
+
+// ─── Fetch ALL pending Telegram updates, paginating until caught up ───────────
+// Strategy:
+//   • Save every discovered photo to localStorage BEFORE advancing the offset
+//   • Advance offset only after photos are safely cached — so a crash never loses data
+//   • Repeat until Telegram returns fewer than 100 updates (means we're at the tip)
+async function fetchAllUpdates(onBatch) {
+  let offset    = getOffset();
+  let allResults = [];
+
+  while (true) {
+    const params = `limit=100&allowed_updates=${encodeURIComponent('["channel_post","edited_channel_post"]')}${offset ? `&offset=${offset}` : ""}`;
+    const r = await fetch(`${API}/getUpdates?${params}`);
+    if (!r.ok) throw new Error(`Network error ${r.status}`);
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.description || "Telegram API error");
+
+    const batch = d.result;
+    if (!batch.length) break;
+
+    // Callback so caller can save photos before we advance offset
+    if (onBatch) await onBatch(batch);
+
+    // Advance offset past this batch
+    const maxId = batch[batch.length - 1].update_id;
+    offset = maxId + 1;
+    saveOffset(offset);
+    allResults = allResults.concat(batch);
+
+    // Fewer than 100 = we're caught up
+    if (batch.length < 100) break;
+  }
+  return allResults;
 }
 
 function parsePhotosFromUpdates(updates, skipIds = new Set()) {
@@ -83,7 +109,7 @@ function parsePhotosFromUpdates(updates, skipIds = new Set()) {
     const edited = u.edited_channel_post;
     if (edited && CHANNEL_ID && String(edited.chat.id) === String(CHANNEL_ID)) {
       if ((edited.caption || "").toLowerCase().includes("#deleted")) {
-        telegramDeletedIds.add(edited.message_id);
+        deletedIds.add(edited.message_id);
       }
     }
 
@@ -557,12 +583,11 @@ export default function LeosPOV() {
     setErrMsg("");
 
     try {
-      // 1. Restore from cache instantly → stable skeleton grid with correct aspect ratios
-      const cached    = force ? [] : getCached();
-      const cachedIds = new Set(cached.map(p => p.id));
+      // 1. Restore from cache instantly with preserved URLs
+      const cached = force ? [] : getCached();
+      if (force) saveOffset(0); // reset offset on force reload
 
       if (cached.length > 0) {
-        // Show cached skeletons immediately — but preserve any in-memory resolved URLs
         setPhotos(prev => {
           const prevMap = new Map(prev.map(p => [p.id, p]));
           return cached.map(p => {
@@ -573,41 +598,58 @@ export default function LeosPOV() {
         setStatus("resolving");
       }
 
-      // 2. Pull all available Telegram updates (no offset = nothing ever deleted from server)
-      const updates   = await fetchUpdates();
-      const { photos: newPhotos, deletedIds } = parsePhotosFromUpdates(updates, force ? new Set() : cachedIds);
+      // 2. Paginate through ALL pending Telegram updates, saving each batch
+      //    onBatch fires before offset advances — photos are never lost to a crash
+      const deleted   = getDeleted();
+      let allNew = [];
 
-      // Apply #deleted caption changes + admin deletions
-      const deleted = getDeleted();
-      deletedIds.forEach(id => { deleted.add(id); addDeleted(id); });
+      await fetchAllUpdates(async (batch) => {
+        const currentCache  = getCached();
+        const currentIds    = new Set([...currentCache.map(p => p.id), ...getDeleted()]);
+        const { photos: batchPhotos, deletedIds } = parsePhotosFromUpdates(batch, currentIds);
 
-      // 3. Merge + sort, filtering out hidden/deleted IDs
-      const seen = new Set();
-      const merged = [...newPhotos, ...cached.map(p => ({ ...p, thumbUrl: null, url: null }))]
-        .filter(p => {
-          if (seen.has(p.id)) return false;
-          seen.add(p.id);
-          return !deleted.has(p.id);
-        })
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
+        // Apply any #deleted captions found
+        deletedIds.forEach(id => { deleted.add(id); addDeleted(id); });
 
-      saveCached(merged);
-      // Merge in any already-resolved URLs so images don't flicker on reload
-      setPhotos(prev => {
-        const prevMap = new Map(prev.map(p => [p.id, p]));
-        return merged.map(p => {
-          const existing = prevMap.get(p.id);
-          return (existing?.url && existing.url !== "error") ? existing : p;
+        if (!batchPhotos.length) return;
+
+        // Merge batch into cache immediately
+        const seen = new Set();
+        const merged = [...batchPhotos, ...currentCache]
+          .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !deleted.has(p.id); })
+          .sort((a, b) => new Date(b.date) - new Date(a.date));
+        saveCached(merged);
+        allNew = allNew.concat(batchPhotos);
+
+        // Update UI progressively
+        setPhotos(prev => {
+          const prevMap = new Map(prev.map(p => [p.id, p]));
+          return merged.map(p => {
+            const ex = prevMap.get(p.id);
+            return (ex?.url && ex.url !== "error") ? ex : p;
+          });
         });
       });
-      setPage(0); // reset to first page on (re)load
-      if (!merged.length) { setStatus("done"); return; }
+
+      // 3. Final merged list from cache (all batches now saved)
+      const finalDeleted = getDeleted();
+      const finalCache   = getCached().filter(p => !finalDeleted.has(p.id));
+      saveCached(finalCache);
+
+      setPhotos(prev => {
+        const prevMap = new Map(prev.map(p => [p.id, p]));
+        return finalCache.map(p => {
+          const ex = prevMap.get(p.id);
+          return (ex?.url && ex.url !== "error") ? ex : p;
+        });
+      });
+      setPage(0);
+      if (!finalCache.length) { setStatus("done"); return; }
       setStatus("resolving");
 
-      // 4. Resolve each photo independently in parallel → patch as each completes
-      //    Above-fold (first 8) fire immediately; rest get a tiny stagger to avoid throttling
+      // 4. Resolve all unresolved photos (staggered to avoid rate limiting)
       await Promise.all(
-        merged.map((photo, i) =>
+        finalCache.map((photo, i) =>
           new Promise(resolve => {
             const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
             setTimeout(() => resolvePhoto(photo, patchPhoto).then(resolve), delay);
@@ -628,52 +670,37 @@ export default function LeosPOV() {
   const silentPoll = useCallback(async () => {
     if (loadingRef.current) return;
     try {
-      const updates   = await fetchUpdates();
-      const cached    = getCached();
-      // skipIds = cached IDs + permanently deleted IDs
-      // Without deleted IDs, deleted photos would re-appear as "new" every poll
-      const skipIds   = new Set([...cached.map(p => p.id), ...getDeleted()]);
-      const { photos: newPhotos, deletedIds } = parsePhotosFromUpdates(updates, skipIds);
-
-      // Apply #deleted caption changes
-      const deleted = getDeleted();
+      const deleted    = getDeleted();
+      let totalNew     = 0;
       let deletedCount = 0;
-      deletedIds.forEach(id => { if (!deleted.has(id)) { deleted.add(id); addDeleted(id); deletedCount++; } });
 
-      if (!newPhotos.length && deletedCount === 0) return;
+      await fetchAllUpdates(async (batch) => {
+        const currentCache = getCached();
+        const skipIds      = new Set([...currentCache.map(p => p.id), ...getDeleted()]);
+        const { photos: batchPhotos, deletedIds } = parsePhotosFromUpdates(batch, skipIds);
 
-      const fullCached = getCached();
-      const seenPoll = new Set();
-      const merged = [...newPhotos, ...fullCached.map(p => ({ ...p, thumbUrl: null, url: null }))]
-        .filter(p => {
-          if (seenPoll.has(p.id)) return false;
-          seenPoll.add(p.id);
-          return !deleted.has(p.id);
-        })
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
+        deletedIds.forEach(id => { if (!deleted.has(id)) { deleted.add(id); addDeleted(id); deletedCount++; } });
+        if (!batchPhotos.length) return;
 
-      saveCached(merged);
+        totalNew += batchPhotos.length;
+        const seen = new Set();
+        const merged = [...batchPhotos, ...currentCache]
+          .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !deleted.has(p.id); })
+          .sort((a, b) => new Date(b.date) - new Date(a.date));
+        saveCached(merged);
 
-      // Preserve already-resolved URLs for photos already in state
-      // so the grid doesn't go blank during a poll update
-      setPhotos(prev => {
-        const prevMap = new Map(prev.map(p => [p.id, p]));
-        return merged.map(p => {
-          const existing = prevMap.get(p.id);
-          if (existing?.url && existing.url !== "error") return existing;
-          return p;
+        setPhotos(prev => {
+          const prevMap = new Map(prev.map(p => [p.id, p]));
+          return merged.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
         });
+
+        // Resolve new photos immediately
+        await Promise.all(batchPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
       });
 
-      if (deletedCount > 0) showToast(`${deletedCount} photo${deletedCount > 1 ? "s" : ""} permanently deleted`);
-      if (newPhotos.length > 0) setNewPrompt({ count: newPhotos.length });
-
-      // Only resolve photos that don't have a URL yet (new arrivals)
-      const toResolve = merged.filter(p => !p.url || p.url === "error");
-      if (toResolve.length > 0) {
-        await Promise.all(toResolve.map(photo => resolvePhoto(photo, patchPhoto)));
-      }
-      setStatus("done");
+      if (deletedCount > 0) showToast(`${deletedCount} photo${deletedCount > 1 ? "s" : ""} removed`);
+      if (totalNew > 0) setNewPrompt({ count: totalNew });
+      if (totalNew > 0 || deletedCount > 0) setStatus("done");
     } catch {}
   }, [patchPhoto, showToast]);
 
@@ -725,19 +752,32 @@ export default function LeosPOV() {
     return () => window.removeEventListener("keydown", h);
   }, [lightbox, pageVisible.length, settings]);
 
-  const handleReset = () => {
-    try {
-      // Only clear the display cache + url memory — deleted blacklist is preserved
-      localStorage.removeItem(CACHE_KEY);
-      urlCache.clear();
-    } catch {}
-    loadingRef.current = false;
-    setPhotos([]);
-    setStatus("idle");
+  const handleReset = useCallback(async () => {
+    try { urlCache.clear(); } catch {}
     setResetDone(true);
-    showToast("Re-fetching gallery…");
-    setTimeout(() => { setSettings(false); setResetDone(false); load(true); }, 800);
-  };
+    setSettings(false);
+    showToast("Optimizing…");
+
+    // Null out all URLs so cells show skeletons while we re-resolve
+    const snapshot = getCached();
+    const blanked  = snapshot.map(p => ({ ...p, thumbUrl: null, url: null }));
+    setPhotos(blanked);
+    setStatus("resolving");
+
+    // Re-resolve every photo with fresh URLs (staggered to avoid rate limiting)
+    await Promise.all(
+      blanked.map((photo, i) =>
+        new Promise(resolve => {
+          const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
+          setTimeout(() => resolvePhoto(photo, patchPhoto).then(resolve), delay);
+        })
+      )
+    );
+
+    setStatus("done");
+    setResetDone(false);
+    showToast("Done — images reloaded fresh.");
+  }, [patchPhoto, showToast]);
 
   const handleDeleteAll = () => {
     try {
@@ -1423,11 +1463,11 @@ export default function LeosPOV() {
                   <div className="pf-sett-act"><span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""}</span></div>
                 </div>
                 <div className="pf-sett-row">
-                  <div><p className="pf-sett-lbl">Reset Gallery</p><p className="pf-sett-desc">Clears local cache and re-fetches.<br />Optimizes storage. Deleted photos stay gone.</p></div>
+                  <div><p className="pf-sett-lbl">Clear Cache &amp; Optimize</p><p className="pf-sett-desc">Flushes image URL cache so all photos<br />reload with fresh links. No images are deleted.</p></div>
                   <div className="pf-sett-act">
                     {resetDone
                       ? <span className="pf-btn-ok">✓ Done</span>
-                      : <button className="pf-btn-danger" onClick={handleReset} disabled={isWorking}>Reset Gallery</button>}
+                      : <button className="pf-btn" onClick={handleReset} disabled={isWorking}>Optimize</button>}
                   </div>
                 </div>
                 <div className="pf-sett-row">
