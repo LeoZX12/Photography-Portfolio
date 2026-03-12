@@ -3,14 +3,43 @@ import { useState, useEffect, useCallback, useRef } from "react";
 const BOT_TOKEN  = "8662339296:AAEMzUBkgN9nuDLmDgxE93l5IarlGiB0Ikc";
 const CHANNEL_ID = "-1003831838516";
 const API        = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const CACHE_KEY   = "tg_leos_pov_v3";
-const DELETED_KEY = "tg_leos_pov_deleted_v1";
-const OFFSET_KEY  = "tg_leos_pov_offset_v1"; // tracks highest processed update_id
 const SECRET     = "LJCBSET";
 const POLL_MS    = 20000;
 const PAGE_SIZE  = 50;
 
-// ─── In-memory URL cache (survives re-renders, not page reload – Telegram URLs expire) ───
+// ═══════════════════════════════════════════════════════════════════════
+//  STORAGE — window.storage with shared=true is THE database.
+//  All devices/browsers read and write the same keys.
+//  No localStorage is used anywhere.
+// ═══════════════════════════════════════════════════════════════════════
+const KEY_PHOTOS  = "leos_pov_photos_v3";   // [{id,file_id,thumb_file_id,caption,date,w,h}]
+const KEY_DELETED = "leos_pov_deleted_v3";  // [id, id, ...]  — permanently hidden IDs
+const KEY_OFFSET  = "leos_pov_offset_v3";   // number         — last processed update_id + 1
+
+async function dbGet(key) {
+  try   { const r = await window.storage.get(key, true); return r ? JSON.parse(r.value) : null; }
+  catch { return null; }
+}
+async function dbSet(key, val) {
+  try   { await window.storage.set(key, JSON.stringify(val), true); }
+  catch {}
+}
+
+// Photos
+async function dbGetPhotos()      { const r = await dbGet(KEY_PHOTOS);  return Array.isArray(r) ? r : []; }
+async function dbSetPhotos(arr)   { await dbSet(KEY_PHOTOS,  arr.map(({id,file_id,thumb_file_id,caption,date,w,h}) => ({id,file_id,thumb_file_id,caption,date,w,h}))); }
+
+// Deleted IDs
+async function dbGetDeleted()     { const r = await dbGet(KEY_DELETED); return new Set(Array.isArray(r) ? r : []); }
+async function dbSetDeleted(set)  { await dbSet(KEY_DELETED, [...set]); }
+
+// Offset
+async function dbGetOffset()      { const r = await dbGet(KEY_OFFSET);  return (typeof r === "number" && r > 0) ? r : 0; }
+async function dbSetOffset(n)     { await dbSet(KEY_OFFSET,  n); }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  URL CACHE — in-memory only (Telegram URLs expire, never persisted)
+// ═══════════════════════════════════════════════════════════════════════
 const urlCache = new Map();
 async function resolveUrl(file_id) {
   if (urlCache.has(file_id)) return urlCache.get(file_id);
@@ -25,8 +54,6 @@ async function resolveUrl(file_id) {
   } catch {}
   return null;
 }
-
-// ─── Resolve thumb + full in parallel, update photo entry live ───
 async function resolvePhoto(photo, onUpdate) {
   const [thumbUrl, fullUrl] = await Promise.all([
     resolveUrl(photo.thumb_file_id),
@@ -37,167 +64,50 @@ async function resolvePhoto(photo, onUpdate) {
   return updated;
 }
 
-// ─── localStorage ───
-function getCached() {
-  try { return JSON.parse(localStorage.getItem(CACHE_KEY) || "[]"); } catch { return []; }
-}
-function saveCached(photos) {
-  try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(
-      photos.map(({ id, file_id, thumb_file_id, caption, date, w, h }) =>
-        ({ id, file_id, thumb_file_id, caption, date, w, h }))
-    ));
-  } catch {}
-}
-
-
-// ─── Deleted IDs store ───────────────────────────────────────────────────────
-function getDeleted() {
-  try { return new Set(JSON.parse(localStorage.getItem(DELETED_KEY) || "[]")); } catch { return new Set(); }
-}
-function saveDeleted(set) {
-  try { localStorage.setItem(DELETED_KEY, JSON.stringify([...set])); } catch {}
-}
-function addDeleted(id) {
-  const s = getDeleted(); s.add(id); saveDeleted(s);
-}
-
-// ─── Offset helpers ──────────────────────────────────────────────────────────
-function getOffset()   { try { return parseInt(localStorage.getItem(OFFSET_KEY) || "0", 10) || 0; } catch { return 0; } }
-function saveOffset(n) { try { localStorage.setItem(OFFSET_KEY, String(n)); } catch {} }
-
-// ─── Shared cross-device storage (window.storage — syncs across all devices/browsers) ───
-// All keys use shared=true so every device/browser sees the same data.
-const WS_PHOTOS  = "leos_pov_photos_v1";
-const WS_DELETED = "leos_pov_deleted_v1";
-const WS_OFFSET  = "leos_pov_offset_v1";
-
-async function wsGet(key) {
-  try { const r = await window.storage.get(key); return r ? JSON.parse(r.value) : null; }
-  catch { return null; }
-}
-async function wsSet(key, val) {
-  try { await window.storage.set(key, JSON.stringify(val), true); } catch {}
-}
-
-// Merge shared (window.storage) + local (localStorage) photo caches
-async function getUnifiedCache() {
-  const [shared, local] = await Promise.all([wsGet(WS_PHOTOS), Promise.resolve(getCached())]);
-  const map = new Map();
-  [...(shared || []), ...(local || [])].forEach(p => { if (!map.has(p.id)) map.set(p.id, p); });
-  return [...map.values()].sort((a, b) => new Date(b.date) - new Date(a.date));
-}
-
-// Merge shared + local deleted sets
-async function getUnifiedDeleted() {
-  const [shared, local] = await Promise.all([wsGet(WS_DELETED), Promise.resolve(getDeleted())]);
-  const merged = new Set([...(shared || []), ...local]);
-  return merged;
-}
-
-// Persist photo cache to BOTH local + shared storage
-async function saveUnifiedCache(photos) {
-  const slim = photos.map(({ id, file_id, thumb_file_id, caption, date, w, h }) =>
-    ({ id, file_id, thumb_file_id, caption, date, w, h }));
-  saveCached(slim);
-  await wsSet(WS_PHOTOS, slim);
-}
-
-// Persist deleted set to BOTH local + shared storage
-async function saveUnifiedDeleted(set) {
-  saveDeleted(set);
-  await wsSet(WS_DELETED, [...set]);
-}
-
-// Add one ID to the unified deleted set
-async function addUnifiedDeleted(id) {
-  const s = await getUnifiedDeleted();
-  s.add(id);
-  await saveUnifiedDeleted(s);
-}
-
-// Get the highest offset across both stores
-async function getUnifiedOffset() {
-  const shared = await wsGet(WS_OFFSET);
-  return Math.max(getOffset(), shared || 0);
-}
-
-async function saveUnifiedOffset(n) {
-  saveOffset(n);
-  await wsSet(WS_OFFSET, n);
-}
-
-// ─── Fetch ALL pending Telegram updates, paginating until caught up ───────────
-// Strategy:
-//   • Save every discovered photo to localStorage BEFORE advancing the offset
-//   • Advance offset only after photos are safely cached — so a crash never loses data
-//   • Repeat until Telegram returns fewer than 100 updates (means we're at the tip)
-async function fetchAllUpdates(onBatch) {
-  // Use the highest offset across all devices so we never re-process old updates
-  let offset    = await getUnifiedOffset();
-  let allResults = [];
-
+// ═══════════════════════════════════════════════════════════════════════
+//  TELEGRAM — fetch updates in batches, advancing shared offset
+// ═══════════════════════════════════════════════════════════════════════
+async function fetchNewUpdates(onBatch) {
+  let offset = await dbGetOffset();
   while (true) {
-    const params = `limit=100&allowed_updates=${encodeURIComponent('["channel_post","edited_channel_post"]')}${offset ? `&offset=${offset}` : ""}`;
-    const r = await fetch(`${API}/getUpdates?${params}`);
-    if (!r.ok) throw new Error(`Network error ${r.status}`);
-    const d = await r.json();
-    if (!d.ok) throw new Error(d.description || "Telegram API error");
-
+    const p   = `limit=100&allowed_updates=${encodeURIComponent('["channel_post","edited_channel_post"]')}${offset ? `&offset=${offset}` : ""}`;
+    const r   = await fetch(`${API}/getUpdates?${p}`);
+    if (!r.ok) throw new Error(`Network ${r.status}`);
+    const d   = await r.json();
+    if (!d.ok) throw new Error(d.description || "Telegram error");
     const batch = d.result;
     if (!batch.length) break;
-
-    // Callback fires BEFORE we advance offset — photos saved before acknowledgement
     if (onBatch) await onBatch(batch);
-
-    // Advance offset on ALL devices via shared storage
     const maxId = batch[batch.length - 1].update_id;
     offset = maxId + 1;
-    await saveUnifiedOffset(offset);
-    allResults = allResults.concat(batch);
-
-    // Fewer than 100 = caught up
+    await dbSetOffset(offset);
     if (batch.length < 100) break;
   }
-  return allResults;
 }
 
-function parsePhotosFromUpdates(updates, skipIds = new Set()) {
-  const photos = [];
-  const deletedIds = new Set(); // IDs permanently deleted via #deleted caption
-
-  for (const u of updates) {
-    // Detect #deleted caption edits on existing posts
+function extractPhotosFromBatch(batch, skipIds, deleted) {
+  const photos    = [];
+  const newDelIds = new Set();
+  for (const u of batch) {
     const edited = u.edited_channel_post;
-    if (edited && CHANNEL_ID && String(edited.chat.id) === String(CHANNEL_ID)) {
-      if ((edited.caption || "").toLowerCase().includes("#deleted")) {
-        deletedIds.add(edited.message_id);
-      }
+    if (edited && String(edited.chat.id) === String(CHANNEL_ID)) {
+      if ((edited.caption || "").toLowerCase().includes("#deleted"))
+        newDelIds.add(edited.message_id);
     }
-
     const post = u.channel_post;
     if (!post?.photo) continue;
-    if (CHANNEL_ID && String(post.chat.id) !== String(CHANNEL_ID)) continue;
-    if (skipIds.has(post.message_id)) continue;
-    // Skip if caption already has #deleted
+    if (String(post.chat.id) !== String(CHANNEL_ID)) continue;
+    if (skipIds.has(post.message_id) || deleted.has(post.message_id)) continue;
     if ((post.caption || "").toLowerCase().includes("#deleted")) continue;
-
     const sizes   = post.photo;
     const largest = sizes[sizes.length - 1];
     const thumb   = sizes.find(s => s.width >= 80) || sizes[0];
-    photos.push({
-      id:            post.message_id,
-      file_id:       largest.file_id,
-      thumb_file_id: thumb.file_id,
-      caption:       post.caption || "",
-      date:          new Date(post.date * 1000),
-      w:             largest.width,
-      h:             largest.height,
-      thumbUrl:      null,
-      url:           null,
-    });
+    photos.push({ id: post.message_id, file_id: largest.file_id,
+      thumb_file_id: thumb.file_id, caption: post.caption || "",
+      date: new Date(post.date * 1000), w: largest.width, h: largest.height,
+      thumbUrl: null, url: null });
   }
-  return { photos, deletedIds };
+  return { photos, newDelIds };
 }
 
 // ─── Icons ───
@@ -627,94 +537,96 @@ export default function LeosPOV() {
     setPhotos(prev => prev.map(p => p.id === updated.id ? updated : p));
   }, []);
 
-  // Remove a photo from cache + deleted set + state (synced to all devices)
+  // Delete a photo — writes to shared storage, reflected on ALL devices within 20s
   const deletePhoto = useCallback(async (id) => {
-    const s = await getUnifiedDeleted();
-    s.add(id);
-    await saveUnifiedDeleted(s);
-    const updated = getCached().filter(p => p.id !== id);
-    await saveUnifiedCache(updated);
+    // 1. Add to shared deleted set
+    const del = await dbGetDeleted();
+    del.add(id);
+    await dbSetDeleted(del);
+    // 2. Remove from shared photo list
+    const photos = await dbGetPhotos();
+    await dbSetPhotos(photos.filter(p => p.id !== id));
+    // 3. Immediately remove from this device's view
     setPhotos(prev => prev.filter(p => p.id !== id));
     showToast("Photo removed from gallery.");
   }, [showToast]);
 
   // ── Main load ────────────────────────────────────────────────────────────
+  // Architecture:
+  //   • window.storage (shared) is the database — same on every device
+  //   • Step 1: Read shared photos → show gallery instantly on any device
+  //   • Step 2: Fetch new Telegram updates → add unseen photos to shared DB
+  //   • Step 3: Apply shared deleted list → hide deleted photos everywhere
   const load = useCallback(async (force = false) => {
     if (loadingRef.current) return;
     loadingRef.current = true;
     setStatus("loading");
     setErrMsg("");
-
     try {
-      // 1. Load unified cache from ALL devices (shared storage + local)
-      //    This ensures a fresh browser/device immediately sees all previously loaded photos
-      if (force) { await saveUnifiedOffset(0); saveCached([]); }
+      if (force) {
+        // Hard reset: wipe shared DB and re-fetch everything from Telegram
+        await dbSet(KEY_PHOTOS,  []);
+        await dbSet(KEY_DELETED, []);
+        await dbSet(KEY_OFFSET,  0);
+        urlCache.clear();
+      }
 
-      const cached = force ? [] : await getUnifiedCache();
-
-      if (cached.length > 0) {
-        // Seed localStorage from shared storage so future local reads are fast
-        saveCached(cached);
+      // 1. Load current shared photo list (instant on any device that's loaded before)
+      const deleted = await dbGetDeleted();
+      const stored  = (await dbGetPhotos()).filter(p => !deleted.has(p.id));
+      if (stored.length > 0) {
         setPhotos(prev => {
-          const prevMap = new Map(prev.map(p => [p.id, p]));
-          return cached.map(p => {
-            const ex = prevMap.get(p.id);
-            return ex?.url ? ex : { ...p, thumbUrl: null, url: null };
-          });
+          const m = new Map(prev.map(p => [p.id, p]));
+          return stored.map(p => { const e = m.get(p.id); return e?.url ? e : { ...p, thumbUrl: null, url: null }; });
         });
         setStatus("resolving");
       }
 
-      // 2. Pull unified deleted list (covers deletions from ALL devices)
-      const deleted = await getUnifiedDeleted();
+      // 2. Fetch any Telegram updates not yet processed (from shared offset)
+      await fetchNewUpdates(async (batch) => {
+        const current = await dbGetPhotos();
+        const skip    = new Set(current.map(p => p.id));
+        const del     = await dbGetDeleted();
+        const { photos: fresh, newDelIds } = extractPhotosFromBatch(batch, skip, del);
 
-      // 3. Paginate Telegram updates — each batch saved before offset advances
-      await fetchAllUpdates(async (batch) => {
-        const currentCache = getCached();
-        const currentIds   = new Set([...currentCache.map(p => p.id), ...deleted]);
-        const { photos: batchPhotos, deletedIds } = parsePhotosFromUpdates(batch, currentIds);
-
-        for (const id of deletedIds) { deleted.add(id); }
-        if (deletedIds.size > 0) await saveUnifiedDeleted(deleted);
-
-        if (!batchPhotos.length) return;
+        if (newDelIds.size > 0) {
+          newDelIds.forEach(id => del.add(id));
+          await dbSetDeleted(del);
+        }
+        if (!fresh.length) return;
 
         const seen = new Set();
-        const merged = [...batchPhotos, ...currentCache]
-          .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !deleted.has(p.id); })
+        const merged = [...fresh, ...current]
+          .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !del.has(p.id); })
           .sort((a, b) => new Date(b.date) - new Date(a.date));
-
-        await saveUnifiedCache(merged);
+        await dbSetPhotos(merged);
 
         setPhotos(prev => {
-          const prevMap = new Map(prev.map(p => [p.id, p]));
-          return merged.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
+          const m = new Map(prev.map(p => [p.id, p]));
+          return merged.map(p => { const e = m.get(p.id); return (e?.url && e.url !== "error") ? e : p; });
         });
       });
 
-      // 4. Final pass: apply all deletions and save clean list
-      const finalDeleted = await getUnifiedDeleted();
-      const finalCache   = getCached().filter(p => !finalDeleted.has(p.id));
-      await saveUnifiedCache(finalCache);
+      // 3. Final pass: pull clean list from shared storage
+      const finalDel  = await dbGetDeleted();
+      const finalList = (await dbGetPhotos()).filter(p => !finalDel.has(p.id));
+      await dbSetPhotos(finalList);
 
       setPhotos(prev => {
-        const prevMap = new Map(prev.map(p => [p.id, p]));
-        return finalCache.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
+        const m = new Map(prev.map(p => [p.id, p]));
+        return finalList.map(p => { const e = m.get(p.id); return (e?.url && e.url !== "error") ? e : p; });
       });
       setPage(0);
-      if (!finalCache.length) { setStatus("done"); return; }
+      if (!finalList.length) { setStatus("done"); return; }
       setStatus("resolving");
 
-      // 5. Resolve all photos without a URL
-      await Promise.all(
-        finalCache.map((photo, i) =>
-          new Promise(resolve => {
-            const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
-            setTimeout(() => resolvePhoto(photo, patchPhoto).then(resolve), delay);
-          })
-        )
-      );
-
+      // 4. Resolve image URLs (staggered to avoid Telegram rate limiting)
+      await Promise.all(finalList.map((photo, i) =>
+        new Promise(res => {
+          const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
+          setTimeout(() => resolvePhoto(photo, patchPhoto).then(res), delay);
+        })
+      ));
       setStatus("done");
     } catch (e) {
       setErrMsg(e.message);
@@ -724,54 +636,47 @@ export default function LeosPOV() {
     }
   }, [patchPhoto]);
 
-  // ── Silent poll ──────────────────────────────────────────────────────────
+  // ── Silent poll ───────────────────────────────────────────────────────────
   const silentPoll = useCallback(async () => {
     if (loadingRef.current) return;
     try {
-      // Always pull the unified deleted list — catches deletions from other devices
-      const deleted    = await getUnifiedDeleted();
-      let totalNew     = 0;
-      let deletedCount = 0;
-
-      await fetchAllUpdates(async (batch) => {
-        const currentCache = getCached();
-        const skipIds      = new Set([...currentCache.map(p => p.id), ...deleted]);
-        const { photos: batchPhotos, deletedIds } = parsePhotosFromUpdates(batch, skipIds);
-
-        for (const id of deletedIds) {
-          if (!deleted.has(id)) { deleted.add(id); deletedCount++; }
-        }
-        if (deletedIds.size > 0) await saveUnifiedDeleted(deleted);
-
-        if (!batchPhotos.length) return;
-
-        totalNew += batchPhotos.length;
-        const seen = new Set();
-        const merged = [...batchPhotos, ...currentCache]
-          .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !deleted.has(p.id); })
-          .sort((a, b) => new Date(b.date) - new Date(a.date));
-        await saveUnifiedCache(merged);
-
-        setPhotos(prev => {
-          const prevMap = new Map(prev.map(p => [p.id, p]));
-          return merged.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
-        });
-
-        await Promise.all(batchPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
+      // Check for cross-device deletions first
+      const deleted = await dbGetDeleted();
+      setPhotos(prev => {
+        const cleaned = prev.filter(p => !deleted.has(p.id));
+        if (cleaned.length !== prev.length) return cleaned;
+        return prev;
       });
 
-      // Also apply any cross-device deletions that happened since last poll
-      const currentPhotos = getCached();
-      const afterDeleted  = currentPhotos.filter(p => !deleted.has(p.id));
-      if (afterDeleted.length !== currentPhotos.length) {
-        await saveUnifiedCache(afterDeleted);
-        setPhotos(prev => prev.filter(p => !deleted.has(p.id)));
-        deletedCount += currentPhotos.length - afterDeleted.length;
-      }
+      // Fetch any new Telegram uploads
+      let totalNew = 0;
+      await fetchNewUpdates(async (batch) => {
+        const current = await dbGetPhotos();
+        const skip    = new Set(current.map(p => p.id));
+        const del     = await dbGetDeleted();
+        const { photos: fresh, newDelIds } = extractPhotosFromBatch(batch, skip, del);
 
-      if (deletedCount > 0) showToast(`${deletedCount} photo${deletedCount > 1 ? "s" : ""} removed`);
-      if (totalNew > 0) setNewPrompt({ count: totalNew });
-      if (totalNew > 0 || deletedCount > 0) setStatus("done");
+        if (newDelIds.size > 0) {
+          newDelIds.forEach(id => del.add(id));
+          await dbSetDeleted(del);
+        }
+        if (!fresh.length) return;
+
+        totalNew += fresh.length;
+        const seen = new Set();
+        const merged = [...fresh, ...current]
+          .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !del.has(p.id); })
+          .sort((a, b) => new Date(b.date) - new Date(a.date));
+        await dbSetPhotos(merged);
+
+        setPhotos(prev => {
+          const m = new Map(prev.map(p => [p.id, p]));
+          return merged.map(p => { const e = m.get(p.id); return (e?.url && e.url !== "error") ? e : p; });
+        });
+        await Promise.all(fresh.map(photo => resolvePhoto(photo, patchPhoto)));
+      });
+
+      if (totalNew > 0) { setNewPrompt({ count: totalNew }); setStatus("done"); }
     } catch {}
   }, [patchPhoto, showToast]);
 
@@ -824,48 +729,43 @@ export default function LeosPOV() {
   }, [lightbox, pageVisible.length, settings]);
 
   const handleReset = useCallback(async () => {
-    try { urlCache.clear(); } catch {}
+    urlCache.clear();
     setResetDone(true);
     setSettings(false);
-    showToast("Optimizing…");
+    showToast("Optimizing — reloading fresh URLs…");
 
-    // Use unified cache (pulls from shared storage = all devices' photos)
-    const snapshot = await getUnifiedCache();
-    const blanked  = snapshot.map(p => ({ ...p, thumbUrl: null, url: null }));
+    // Get current photo list from shared storage, blank URLs, re-resolve
+    const current = await dbGetPhotos();
+    const deleted = await dbGetDeleted();
+    const list    = current.filter(p => !deleted.has(p.id));
+    const blanked = list.map(p => ({ ...p, thumbUrl: null, url: null }));
     setPhotos(blanked);
     setStatus("resolving");
 
-    await Promise.all(
-      blanked.map((photo, i) =>
-        new Promise(resolve => {
-          const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
-          setTimeout(() => resolvePhoto(photo, patchPhoto).then(resolve), delay);
-        })
-      )
-    );
-
+    await Promise.all(blanked.map((photo, i) =>
+      new Promise(res => {
+        const delay = i < 8 ? 0 : Math.floor(i / 6) * 150;
+        setTimeout(() => resolvePhoto(photo, patchPhoto).then(res), delay);
+      })
+    ));
     setStatus("done");
     setResetDone(false);
     showToast("Done — images reloaded fresh.");
   }, [patchPhoto, showToast]);
 
   const handleDeleteAll = useCallback(async () => {
-    try {
-      // Blacklist all current IDs in BOTH local AND shared storage
-      const allPhotos = await getUnifiedCache();
-      const blacklist = await getUnifiedDeleted();
-      allPhotos.forEach(p => blacklist.add(p.id));
-      await saveUnifiedDeleted(blacklist);
-      // Wipe display cache on all devices
-      await saveUnifiedCache([]);
-      urlCache.clear();
-      localStorage.removeItem(CACHE_KEY);
-    } catch {}
-    loadingRef.current = false;
+    // Add all current photo IDs to the shared deleted set → they disappear on ALL devices
+    const current = await dbGetPhotos();
+    const del     = await dbGetDeleted();
+    current.forEach(p => del.add(p.id));
+    await dbSetDeleted(del);
+    // Clear shared photo list
+    await dbSetPhotos([]);
+    urlCache.clear();
     setPhotos([]);
     setStatus("done");
     setDeleteAllDone(true);
-    showToast("All images permanently deleted.");
+    showToast("All photos cleared on all devices.");
     setTimeout(() => { setSettings(false); setDeleteAllDone(false); }, 1200);
   }, []);
 
@@ -1530,8 +1430,8 @@ export default function LeosPOV() {
               </div>
               <div className="pf-sett-body">
                 <div className="pf-sett-row">
-                  <div><p className="pf-sett-lbl">Gallery Cache</p><p className="pf-sett-desc">Locally cached photo metadata<br />for instant loading on refresh.</p></div>
-                  <div className="pf-sett-act"><span className="pf-stat"><strong>{getCached().length}</strong> photo{getCached().length !== 1 ? "s" : ""}</span></div>
+                  <div><p className="pf-sett-lbl">Shared Database</p><p className="pf-sett-desc">Photos stored in shared cloud storage.<br />Synced across all your devices.</p></div>
+                  <div className="pf-sett-act"><span className="pf-stat"><strong>{photos.length}</strong> photo{photos.length !== 1 ? "s" : ""}</span></div>
                 </div>
                 <div className="pf-sett-row">
                   <div><p className="pf-sett-lbl">Clear Cache &amp; Optimize</p><p className="pf-sett-desc">Flushes image URL cache so all photos<br />reload with fresh links. No images are deleted.</p></div>
