@@ -66,13 +66,75 @@ function addDeleted(id) {
 function getOffset()   { try { return parseInt(localStorage.getItem(OFFSET_KEY) || "0", 10) || 0; } catch { return 0; } }
 function saveOffset(n) { try { localStorage.setItem(OFFSET_KEY, String(n)); } catch {} }
 
+// ─── Shared cross-device storage (window.storage — syncs across all devices/browsers) ───
+// All keys use shared=true so every device/browser sees the same data.
+const WS_PHOTOS  = "leos_pov_photos_v1";
+const WS_DELETED = "leos_pov_deleted_v1";
+const WS_OFFSET  = "leos_pov_offset_v1";
+
+async function wsGet(key) {
+  try { const r = await window.storage.get(key); return r ? JSON.parse(r.value) : null; }
+  catch { return null; }
+}
+async function wsSet(key, val) {
+  try { await window.storage.set(key, JSON.stringify(val), true); } catch {}
+}
+
+// Merge shared (window.storage) + local (localStorage) photo caches
+async function getUnifiedCache() {
+  const [shared, local] = await Promise.all([wsGet(WS_PHOTOS), Promise.resolve(getCached())]);
+  const map = new Map();
+  [...(shared || []), ...(local || [])].forEach(p => { if (!map.has(p.id)) map.set(p.id, p); });
+  return [...map.values()].sort((a, b) => new Date(b.date) - new Date(a.date));
+}
+
+// Merge shared + local deleted sets
+async function getUnifiedDeleted() {
+  const [shared, local] = await Promise.all([wsGet(WS_DELETED), Promise.resolve(getDeleted())]);
+  const merged = new Set([...(shared || []), ...local]);
+  return merged;
+}
+
+// Persist photo cache to BOTH local + shared storage
+async function saveUnifiedCache(photos) {
+  const slim = photos.map(({ id, file_id, thumb_file_id, caption, date, w, h }) =>
+    ({ id, file_id, thumb_file_id, caption, date, w, h }));
+  saveCached(slim);
+  await wsSet(WS_PHOTOS, slim);
+}
+
+// Persist deleted set to BOTH local + shared storage
+async function saveUnifiedDeleted(set) {
+  saveDeleted(set);
+  await wsSet(WS_DELETED, [...set]);
+}
+
+// Add one ID to the unified deleted set
+async function addUnifiedDeleted(id) {
+  const s = await getUnifiedDeleted();
+  s.add(id);
+  await saveUnifiedDeleted(s);
+}
+
+// Get the highest offset across both stores
+async function getUnifiedOffset() {
+  const shared = await wsGet(WS_OFFSET);
+  return Math.max(getOffset(), shared || 0);
+}
+
+async function saveUnifiedOffset(n) {
+  saveOffset(n);
+  await wsSet(WS_OFFSET, n);
+}
+
 // ─── Fetch ALL pending Telegram updates, paginating until caught up ───────────
 // Strategy:
 //   • Save every discovered photo to localStorage BEFORE advancing the offset
 //   • Advance offset only after photos are safely cached — so a crash never loses data
 //   • Repeat until Telegram returns fewer than 100 updates (means we're at the tip)
 async function fetchAllUpdates(onBatch) {
-  let offset    = getOffset();
+  // Use the highest offset across all devices so we never re-process old updates
+  let offset    = await getUnifiedOffset();
   let allResults = [];
 
   while (true) {
@@ -85,16 +147,16 @@ async function fetchAllUpdates(onBatch) {
     const batch = d.result;
     if (!batch.length) break;
 
-    // Callback so caller can save photos before we advance offset
+    // Callback fires BEFORE we advance offset — photos saved before acknowledgement
     if (onBatch) await onBatch(batch);
 
-    // Advance offset past this batch
+    // Advance offset on ALL devices via shared storage
     const maxId = batch[batch.length - 1].update_id;
     offset = maxId + 1;
-    saveOffset(offset);
+    await saveUnifiedOffset(offset);
     allResults = allResults.concat(batch);
 
-    // Fewer than 100 = we're caught up
+    // Fewer than 100 = caught up
     if (batch.length < 100) break;
   }
   return allResults;
@@ -565,12 +627,13 @@ export default function LeosPOV() {
     setPhotos(prev => prev.map(p => p.id === updated.id ? updated : p));
   }, []);
 
-  // Remove a photo from cache + deleted set + state
-  const deletePhoto = useCallback((id) => {
-    addDeleted(id);
-    urlCache.delete && urlCache.forEach((v, k) => {}); // keep urlCache intact (file_ids reusable)
+  // Remove a photo from cache + deleted set + state (synced to all devices)
+  const deletePhoto = useCallback(async (id) => {
+    const s = await getUnifiedDeleted();
+    s.add(id);
+    await saveUnifiedDeleted(s);
     const updated = getCached().filter(p => p.id !== id);
-    saveCached(updated);
+    await saveUnifiedCache(updated);
     setPhotos(prev => prev.filter(p => p.id !== id));
     showToast("Photo removed from gallery.");
   }, [showToast]);
@@ -583,71 +646,66 @@ export default function LeosPOV() {
     setErrMsg("");
 
     try {
-      // 1. Restore from cache instantly with preserved URLs
-      const cached = force ? [] : getCached();
-      if (force) saveOffset(0); // reset offset on force reload
+      // 1. Load unified cache from ALL devices (shared storage + local)
+      //    This ensures a fresh browser/device immediately sees all previously loaded photos
+      if (force) { await saveUnifiedOffset(0); saveCached([]); }
+
+      const cached = force ? [] : await getUnifiedCache();
 
       if (cached.length > 0) {
+        // Seed localStorage from shared storage so future local reads are fast
+        saveCached(cached);
         setPhotos(prev => {
           const prevMap = new Map(prev.map(p => [p.id, p]));
           return cached.map(p => {
-            const existing = prevMap.get(p.id);
-            return existing?.url ? existing : { ...p, thumbUrl: null, url: null };
+            const ex = prevMap.get(p.id);
+            return ex?.url ? ex : { ...p, thumbUrl: null, url: null };
           });
         });
         setStatus("resolving");
       }
 
-      // 2. Paginate through ALL pending Telegram updates, saving each batch
-      //    onBatch fires before offset advances — photos are never lost to a crash
-      const deleted   = getDeleted();
-      let allNew = [];
+      // 2. Pull unified deleted list (covers deletions from ALL devices)
+      const deleted = await getUnifiedDeleted();
 
+      // 3. Paginate Telegram updates — each batch saved before offset advances
       await fetchAllUpdates(async (batch) => {
-        const currentCache  = getCached();
-        const currentIds    = new Set([...currentCache.map(p => p.id), ...getDeleted()]);
+        const currentCache = getCached();
+        const currentIds   = new Set([...currentCache.map(p => p.id), ...deleted]);
         const { photos: batchPhotos, deletedIds } = parsePhotosFromUpdates(batch, currentIds);
 
-        // Apply any #deleted captions found
-        deletedIds.forEach(id => { deleted.add(id); addDeleted(id); });
+        for (const id of deletedIds) { deleted.add(id); }
+        if (deletedIds.size > 0) await saveUnifiedDeleted(deleted);
 
         if (!batchPhotos.length) return;
 
-        // Merge batch into cache immediately
         const seen = new Set();
         const merged = [...batchPhotos, ...currentCache]
           .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !deleted.has(p.id); })
           .sort((a, b) => new Date(b.date) - new Date(a.date));
-        saveCached(merged);
-        allNew = allNew.concat(batchPhotos);
 
-        // Update UI progressively
+        await saveUnifiedCache(merged);
+
         setPhotos(prev => {
           const prevMap = new Map(prev.map(p => [p.id, p]));
-          return merged.map(p => {
-            const ex = prevMap.get(p.id);
-            return (ex?.url && ex.url !== "error") ? ex : p;
-          });
+          return merged.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
         });
       });
 
-      // 3. Final merged list from cache (all batches now saved)
-      const finalDeleted = getDeleted();
+      // 4. Final pass: apply all deletions and save clean list
+      const finalDeleted = await getUnifiedDeleted();
       const finalCache   = getCached().filter(p => !finalDeleted.has(p.id));
-      saveCached(finalCache);
+      await saveUnifiedCache(finalCache);
 
       setPhotos(prev => {
         const prevMap = new Map(prev.map(p => [p.id, p]));
-        return finalCache.map(p => {
-          const ex = prevMap.get(p.id);
-          return (ex?.url && ex.url !== "error") ? ex : p;
-        });
+        return finalCache.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
       });
       setPage(0);
       if (!finalCache.length) { setStatus("done"); return; }
       setStatus("resolving");
 
-      // 4. Resolve all unresolved photos (staggered to avoid rate limiting)
+      // 5. Resolve all photos without a URL
       await Promise.all(
         finalCache.map((photo, i) =>
           new Promise(resolve => {
@@ -670,16 +728,21 @@ export default function LeosPOV() {
   const silentPoll = useCallback(async () => {
     if (loadingRef.current) return;
     try {
-      const deleted    = getDeleted();
+      // Always pull the unified deleted list — catches deletions from other devices
+      const deleted    = await getUnifiedDeleted();
       let totalNew     = 0;
       let deletedCount = 0;
 
       await fetchAllUpdates(async (batch) => {
         const currentCache = getCached();
-        const skipIds      = new Set([...currentCache.map(p => p.id), ...getDeleted()]);
+        const skipIds      = new Set([...currentCache.map(p => p.id), ...deleted]);
         const { photos: batchPhotos, deletedIds } = parsePhotosFromUpdates(batch, skipIds);
 
-        deletedIds.forEach(id => { if (!deleted.has(id)) { deleted.add(id); addDeleted(id); deletedCount++; } });
+        for (const id of deletedIds) {
+          if (!deleted.has(id)) { deleted.add(id); deletedCount++; }
+        }
+        if (deletedIds.size > 0) await saveUnifiedDeleted(deleted);
+
         if (!batchPhotos.length) return;
 
         totalNew += batchPhotos.length;
@@ -687,16 +750,24 @@ export default function LeosPOV() {
         const merged = [...batchPhotos, ...currentCache]
           .filter(p => { if (seen.has(p.id)) return false; seen.add(p.id); return !deleted.has(p.id); })
           .sort((a, b) => new Date(b.date) - new Date(a.date));
-        saveCached(merged);
+        await saveUnifiedCache(merged);
 
         setPhotos(prev => {
           const prevMap = new Map(prev.map(p => [p.id, p]));
           return merged.map(p => { const ex = prevMap.get(p.id); return (ex?.url && ex.url !== "error") ? ex : p; });
         });
 
-        // Resolve new photos immediately
         await Promise.all(batchPhotos.map(photo => resolvePhoto(photo, patchPhoto)));
       });
+
+      // Also apply any cross-device deletions that happened since last poll
+      const currentPhotos = getCached();
+      const afterDeleted  = currentPhotos.filter(p => !deleted.has(p.id));
+      if (afterDeleted.length !== currentPhotos.length) {
+        await saveUnifiedCache(afterDeleted);
+        setPhotos(prev => prev.filter(p => !deleted.has(p.id)));
+        deletedCount += currentPhotos.length - afterDeleted.length;
+      }
 
       if (deletedCount > 0) showToast(`${deletedCount} photo${deletedCount > 1 ? "s" : ""} removed`);
       if (totalNew > 0) setNewPrompt({ count: totalNew });
@@ -758,13 +829,12 @@ export default function LeosPOV() {
     setSettings(false);
     showToast("Optimizing…");
 
-    // Null out all URLs so cells show skeletons while we re-resolve
-    const snapshot = getCached();
+    // Use unified cache (pulls from shared storage = all devices' photos)
+    const snapshot = await getUnifiedCache();
     const blanked  = snapshot.map(p => ({ ...p, thumbUrl: null, url: null }));
     setPhotos(blanked);
     setStatus("resolving");
 
-    // Re-resolve every photo with fresh URLs (staggered to avoid rate limiting)
     await Promise.all(
       blanked.map((photo, i) =>
         new Promise(resolve => {
@@ -779,16 +849,17 @@ export default function LeosPOV() {
     showToast("Done — images reloaded fresh.");
   }, [patchPhoto, showToast]);
 
-  const handleDeleteAll = () => {
+  const handleDeleteAll = useCallback(async () => {
     try {
-      // Blacklist every currently known photo ID so they never come back after refresh
-      const allPhotos = getCached();
-      const blacklist = getDeleted();
+      // Blacklist all current IDs in BOTH local AND shared storage
+      const allPhotos = await getUnifiedCache();
+      const blacklist = await getUnifiedDeleted();
       allPhotos.forEach(p => blacklist.add(p.id));
-      saveDeleted(blacklist);
-      // Now wipe the display cache and url memory
-      localStorage.removeItem(CACHE_KEY);
+      await saveUnifiedDeleted(blacklist);
+      // Wipe display cache on all devices
+      await saveUnifiedCache([]);
       urlCache.clear();
+      localStorage.removeItem(CACHE_KEY);
     } catch {}
     loadingRef.current = false;
     setPhotos([]);
@@ -796,7 +867,7 @@ export default function LeosPOV() {
     setDeleteAllDone(true);
     showToast("All images permanently deleted.");
     setTimeout(() => { setSettings(false); setDeleteAllDone(false); }, 1200);
-  };
+  }, []);
 
   const lbPhoto   = lightbox !== null ? pageVisible[lightbox] : null;
   const isWorking = status === "loading" || status === "resolving";
